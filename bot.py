@@ -1,15 +1,12 @@
 """
-vocab_news_bot/bot.py
+vocab_news_bot/bot.py  —  Spanish B2 News Podcast Bot for Borja.
 
-Chinese Mandarin News Podcast Bot for Borja.
-
-Flow:
-  /news  →  4 topic buttons (economic / political / china / egypt)
-  User picks topic  →  scrape RSS for fresh headlines (≤24h old)
-  →  DeepSeek writes ~5min HSK4 Mandarin podcast script (uses vocab from Google Sheet)
-  →  Gemini Chirp3-HD TTS (one male, one female presenter)
-  →  Send MP3 + 5 collocation buttons (Chinese / English stacked)
-  →  Press button  →  save to Google Sheet col A (Chinese), col B (English), col C (date)
+/news  →  6 topic buttons
+→  scrape RSS for fresh headlines
+→  DeepSeek writes ~5min B2 Spanish podcast script
+→  Gemini Chirp3-HD TTS (one male, one female Spanish presenter)
+→  Send MP3 + 5 collocation buttons (Spanish / English stacked)
+→  Press button  →  no sheet saving (no vocab list needed)
 """
 
 import os
@@ -17,18 +14,15 @@ import re
 import json
 import time
 import wave
-import struct
 import logging
 import asyncio
 import tempfile
 import subprocess
 from io import BytesIO
 from datetime import datetime
-from pathlib import Path
 
 import requests
 import feedparser
-import gspread
 from openai import OpenAI
 from google.oauth2.service_account import Credentials
 from google.cloud import texttospeech
@@ -39,25 +33,22 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ── Env vars (loaded from .env via EnvironmentFile in systemd) ─────────────
+# ── Env vars ───────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY   = os.getenv("DEEPSEEK_API_KEY")
 
 if not TELEGRAM_BOT_TOKEN or not DEEPSEEK_API_KEY:
     raise EnvironmentError("TELEGRAM_BOT_TOKEN and DEEPSEEK_API_KEY must be set.")
 
-# ── Google Sheets ──────────────────────────────────────────────────────────
-GOOGLE_CREDS_FILE  = os.path.join(os.path.dirname(__file__), "google-creds.json")
-SPREADSHEET_URL    = "https://docs.google.com/spreadsheets/d/1H-ezqh5Vcl3_6YWJIy9KvgpDCsM3V6N4LJq0dqNbJS0/edit?gid=0#gid=0"
-SHEET_NAME         = "Chinese"
+# ── Google TTS credentials ─────────────────────────────────────────────────
+GOOGLE_CREDS_FILE = os.path.join(os.path.dirname(__file__), "google-creds.json")
 
-# ── Chirp3-HD voices for Chinese TTS ──────────────────────────────────────
-# One female, one male — both Chirp3-HD, lively and engaging
-FEMALE_VOICE = "cmn-CN-Chirp3-HD-Aoede"   # female, warm and clear
-MALE_VOICE   = "cmn-CN-Chirp3-HD-Puck"    # male, energetic
+# ── Chirp3-HD voices for Spanish TTS ──────────────────────────────────────
+# es-US voices — lively and engaging
+FEMALE_VOICE = "es-US-Chirp3-HD-Aoede"   # female, warm
+MALE_VOICE   = "es-US-Chirp3-HD-Puck"    # male, energetic
 
-# ── News RSS sources ───────────────────────────────────────────────────────
-# We scrape these directly — no API key needed, always fresh
+# ── RSS feeds per topic ────────────────────────────────────────────────────
 RSS_FEEDS = {
     "economic": [
         "https://feeds.bbci.co.uk/news/business/rss.xml",
@@ -78,16 +69,19 @@ RSS_FEEDS = {
         "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml",
         "https://feeds.reuters.com/Reuters/worldNews",
     ],
+    "spain": [
+        "https://feeds.bbci.co.uk/news/world/europe/rss.xml",
+        "https://feeds.reuters.com/Reuters/worldNews",
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    ],
+    "usa": [
+        "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml",
+        "https://feeds.reuters.com/reuters/topNews",
+        "https://rss.nytimes.com/services/xml/rss/nyt/US.xml",
+    ],
 }
 
-# ── Allowed country/org names in Chinese (everything else simplified) ──────
-KNOWN_CHINESE_NAMES = {
-    "美国", "英国", "法国", "德国", "俄罗斯", "乌克兰", "中国",
-    "伊朗", "加拿大", "澳大利亚", "西班牙", "意大利", "埃及",
-    "特朗普", "普京",  # only these two personal names allowed
-}
-
-# ── In-memory store for pending collocations (per chat_id) ─────────────────
+# ── In-memory collocation store ────────────────────────────────────────────
 PENDING_COLLOCATIONS: dict = {}
 
 # ── DeepSeek client ────────────────────────────────────────────────────────
@@ -104,21 +98,22 @@ log = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — Fetch headlines from RSS
+# STEP 1 — Fetch headlines
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_headlines(topic: str, max_stories: int = 5) -> list:
-    """
-    Pull recent headlines from RSS feeds for the chosen topic.
-    Returns list of dicts: {title, summary, published}
-    Only stories published within the last 24 hours are returned.
-    Falls back to latest available if nothing is fresh enough.
-    """
     import time as _time
-    cutoff = _time.time() - 86400  # 24 hours ago
+    cutoff = _time.time() - 86400
 
     stories = []
     seen_titles = set()
+
+    keyword_map = {
+        "china": ["china", "chinese", "beijing", "xi ", "taiwan", "hong kong"],
+        "egypt": ["egypt", "egyptian", "cairo", "nile"],
+        "spain": ["spain", "spanish", "madrid", "barcelona", "pedro sanchez", "iberia"],
+        "usa":   ["trump", "united states", "congress", "washington", "american", "white house"],
+    }
 
     for url in RSS_FEEDS.get(topic, []):
         try:
@@ -129,173 +124,120 @@ def fetch_headlines(topic: str, max_stories: int = 5) -> list:
                     continue
                 seen_titles.add(title)
 
-                # Check recency
                 pub = entry.get("published_parsed")
                 pub_ts = _time.mktime(pub) if pub else 0
 
                 summary = entry.get("summary", entry.get("description", ""))
-                # Strip HTML tags from summary
-                summary = re.sub(r"<[^>]+>", "", summary).strip()
-                summary = summary[:300]
+                summary = re.sub(r"<[^>]+>", "", summary).strip()[:300]
 
                 stories.append({
-                    "title": title,
-                    "summary": summary,
+                    "title":     title,
+                    "summary":   summary,
                     "published": datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d") if pub_ts else "recent",
-                    "fresh": pub_ts >= cutoff,
+                    "fresh":     pub_ts >= cutoff,
                 })
         except Exception as e:
-            log.warning(f"RSS fetch failed for {url}: {e}")
+            log.warning(f"RSS fetch failed {url}: {e}")
 
-    # Prefer fresh stories; fall back to all if not enough fresh ones
     fresh = [s for s in stories if s["fresh"]]
-    pool = fresh if len(fresh) >= 2 else stories
+    pool  = fresh if len(fresh) >= 2 else stories
 
-    # For "china" and "egypt" filter by keyword in title
-    if topic in ("china", "egypt"):
-        keyword_map = {
-            "china":  ["china", "chinese", "beijing", "xi ", "taiwan", "hong kong"],
-            "egypt":  ["egypt", "egyptian", "cairo", "sisi", "nile"],
-        }
+    if topic in keyword_map:
         keywords = keyword_map[topic]
-        filtered = [s for s in pool if any(k in s["title"].lower() or k in s["summary"].lower() for k in keywords)]
-        pool = filtered if filtered else pool  # fall back to all if nothing matches
+        filtered = [s for s in pool if any(
+            k in s["title"].lower() or k in s["summary"].lower() for k in keywords
+        )]
+        pool = filtered if filtered else pool
 
     return pool[:max_stories]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Fetch vocab collocations from Google Sheet
-# ══════════════════════════════════════════════════════════════════════════════
-
-def fetch_vocab_from_sheet(n: int = 8) -> list:
-    """
-    Pull the most recent n Chinese collocations from column A of the sheet.
-    Returns list of Chinese strings.
-    """
-    try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds  = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
-        ss     = client.open_by_url(SPREADSHEET_URL)
-        ws     = ss.worksheet(SHEET_NAME)
-
-        # Column A = Chinese collocations, Column C = date
-        all_rows = ws.get_all_values()
-        # Skip header row if it looks like a header
-        data_rows = [r for r in all_rows if r and r[0] and not r[0].startswith("中") == False or (r[0] and '\u4e00' <= r[0][0] <= '\u9fff')]
-        # Grab column A values (Chinese)
-        chinese_col = [r[0].strip() for r in all_rows if r and r[0].strip() and '\u4e00' <= r[0][0] <= '\u9fff']
-        # Most recent n (sheet appends to bottom)
-        recent = list(reversed(chinese_col))[:n]
-        log.info(f"[Sheet] fetched {len(recent)} vocab items")
-        return recent
-    except Exception as e:
-        log.error(f"Sheet fetch error: {e}")
-        return []
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Generate podcast script via DeepSeek
+# STEP 2 — Generate podcast script via DeepSeek
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOPIC_INSTRUCTIONS = {
     "economic": (
-        "Cover the 2-3 most important economic or business news stories. "
-        "Include any market movements, trade news, or major corporate developments."
+        "Cubre las 2-3 noticias económicas o empresariales más importantes del día. "
+        "Incluye movimientos del mercado, comercio internacional o grandes novedades corporativas."
     ),
     "political": (
-        "Cover the most important geopolitical development OR the biggest story from the United States. "
-        "Choose whichever is more significant today."
+        "Cubre el desarrollo geopolítico más importante O la noticia más destacada a nivel internacional. "
+        "Elige la más relevante del día."
     ),
     "china": (
-        "Cover the latest news about China — domestic policy, economy, foreign relations, or society."
+        "Cubre las últimas noticias sobre China: política interior, economía, relaciones exteriores o sociedad."
     ),
     "egypt": (
-        "Cover the latest news from Egypt — politics, economy, society, or regional relations."
+        "Cubre las últimas noticias de Egipto: política, economía, sociedad o relaciones regionales."
+    ),
+    "spain": (
+        "Cubre las noticias más importantes de España: política, economía, sociedad o cultura."
+    ),
+    "usa": (
+        "Cubre la noticia más importante de los Estados Unidos hoy: política, economía o sociedad."
     ),
 }
 
-# Country/leader name mappings for the script prompt
-NAME_RULES = """
-STRICT NAME RULES — follow exactly:
-- Personal names: ONLY 特朗普 (Trump) and 普京 (Putin) may be used by name.
-  For ALL other people: use their title, e.g. 埃及总统 (Egyptian president), 英伟达CEO (NVIDIA CEO).
-- The first time a country is mentioned: say its Chinese name, then say the English name,
-  then use only Chinese for the rest of that episode.
-  e.g. "中国，也就是China，..." and from then on just 中国.
-- Same rule for major companies the first time they appear.
-- Allowed country names in Chinese: 美国, 英国, 法国, 德国, 俄罗斯, 乌克兰, 中国,
-  伊朗, 加拿大, 澳大利亚, 西班牙, 意大利, 埃及.
-  Any other country: describe it briefly rather than using a potentially unknown name.
-"""
+PODCAST_SYSTEM_PROMPT = """Eres un guionista de podcasts en español.
+Escribes conversaciones animadas y naturales para dos presentadores:
+- Elena — presentadora femenina, cálida y curiosa
+- Marcos — presentador masculino, tranquilo y analítico
 
-PODCAST_SYSTEM_PROMPT = """You are a Mandarin Chinese podcast scriptwriter.
-You write lively, natural, engaging conversation scripts for two hosts:
-- 小梅 (Xiǎo Méi) — female host, warm and curious
-- 大明 (Dà Míng) — male host, calm and analytical
+REGLAS DE IDIOMA:
+- TODO el guion en español (nivel B2 — fluido pero accesible).
+- Vocabulario variado y natural. Nada de lenguaje excesivamente técnico sin explicación.
+- Si un concepto es complejo, uno de los presentadores lo explica brevemente con palabras más simples, en español.
+- No uses inglés salvo para la primera presentación de un nombre propio como se indica abajo.
 
-LANGUAGE RULES:
-- ENTIRE script in Simplified Mandarin Chinese (HSK 4 level for most content).
-- The vocabulary items provided by the user MUST be used naturally — woven into the dialogue.
-  They can be adapted (different tense, measure word added, split across a phrase, etc.).
-- If a passage would be difficult for an upper-intermediate learner, one host can briefly
-  re-explain it in simpler Mandarin immediately after (NOT in English).
-- No English except: the one-time introduction of a country or company name as described below.
+REGLAS DE NOMBRES:
+- Nombres de personas: SOLO se puede decir "Trump" y "Putin" por su nombre.
+  Para los demás usa el cargo: "el presidente de Egipto", "el CEO de NVIDIA", etc.
+- La primera vez que se menciona un país o empresa importante: di el nombre en español,
+  luego el nombre en inglés entre paréntesis, y a partir de entonces solo en español.
+  Ej: "China (China)..." y de ahí en adelante solo "China".
+- Países permitidos por nombre: Estados Unidos, Reino Unido, Francia, Alemania, Rusia,
+  Ucrania, China, Irán, Canadá, Australia, España, Italia, Egipto.
+  Otros países: descríbelos brevemente en lugar de usar un nombre poco conocido.
 
-""" + NAME_RULES + """
-
-OUTPUT FORMAT — return only valid JSON, no markdown fences:
+FORMATO DE SALIDA — solo JSON válido, sin marcadores markdown:
 {
-  "title": "episode title in Chinese",
+  "title": "título del episodio en español",
   "turns": [
-    {"speaker": "小梅", "text": "..."},
-    {"speaker": "大明", "text": "..."},
+    {"speaker": "Elena", "text": "..."},
+    {"speaker": "Marcos", "text": "..."},
     ...
   ],
   "collocations": [
-    {"chinese": "经济下滑", "english": "economic downturn"},
-    {"chinese": "贸易争端", "english": "trade dispute"},
-    {"chinese": "外交关系", "english": "diplomatic relations"},
-    {"chinese": "政策调整", "english": "policy adjustment"},
-    {"chinese": "市场反应", "english": "market reaction"}
+    {"spanish": "caída económica", "english": "economic downturn"},
+    {"spanish": "disputa comercial", "english": "trade dispute"},
+    {"spanish": "relaciones diplomáticas", "english": "diplomatic relations"},
+    {"spanish": "ajuste de política", "english": "policy adjustment"},
+    {"spanish": "reacción del mercado", "english": "market reaction"}
   ]
 }
 
-The "collocations" array: pick 5 collocations that are PARTICULARLY RELEVANT to this episode's content.
-Each collocation: 2-5 Chinese characters, meaningful in the context of today's stories.
-Include English translation.
+El array "collocations": 5 colocaciones especialmente relevantes para este episodio.
+Cada una: 2-5 palabras en español, con traducción al inglés.
 
-Target length: ~25-35 dialogue turns (about 5 minutes of audio at natural pace).
+Duración objetivo: ~25-35 turnos de diálogo (unos 5 minutos de audio a ritmo natural).
 """
 
 
-def generate_script(topic: str, headlines: list, vocab: list) -> dict:
-    """
-    Ask DeepSeek to write the podcast script.
-    Returns the parsed JSON dict with keys: title, turns, collocations.
-    """
+def generate_script(topic: str, headlines: list) -> dict:
     headline_text = "\n".join(
         f"- {s['title']}: {s['summary']}" for s in headlines
     )
-    vocab_text = "、".join(vocab) if vocab else "（无）"
+    topic_instruction = TOPIC_INSTRUCTIONS.get(topic, "Cubre las noticias más importantes del día.")
 
-    topic_instruction = TOPIC_INSTRUCTIONS.get(topic, "Cover today's major news.")
+    user_prompt = f"""Instrucción del tema: {topic_instruction}
 
-    user_prompt = f"""Topic instruction: {topic_instruction}
-
-Today's news headlines (use these as your factual source):
+Titulares de hoy (úsalos como fuente factual):
 {headline_text}
 
-Vocabulary from the learner's Google Sheet (MUST weave these in naturally):
-{vocab_text}
+Escribe ahora el guion completo del podcast."""
 
-Write the full podcast script now."""
-
-    log.info("[DeepSeek] Generating script...")
+    log.info("[DeepSeek] Generating Spanish script...")
     response = ds_client.chat.completions.create(
         model="deepseek-chat",
         messages=[
@@ -307,14 +249,12 @@ Write the full podcast script now."""
     )
 
     raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Try to extract JSON object
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             return json.loads(match.group())
@@ -322,14 +262,11 @@ Write the full podcast script now."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — TTS via Google Chirp3-HD
+# STEP 3 — TTS via Google Chirp3-HD (Spanish)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_tts_client():
-    """Build a Google TTS client from the credentials file."""
-    import google.auth
-    from google.oauth2.service_account import Credentials as SACredentials
-    creds = SACredentials.from_service_account_file(
+    creds = Credentials.from_service_account_file(
         GOOGLE_CREDS_FILE,
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
@@ -337,13 +274,9 @@ def get_tts_client():
 
 
 def synthesize_turn(text: str, voice_name: str, tts_client) -> bytes:
-    """
-    Synthesize a single dialogue turn.
-    Returns raw LINEAR16 PCM bytes (24kHz mono).
-    """
     synthesis_input = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(
-        language_code="cmn-CN",
+        language_code="es-US",
         name=voice_name,
     )
     audio_config = texttospeech.AudioConfig(
@@ -355,32 +288,28 @@ def synthesize_turn(text: str, voice_name: str, tts_client) -> bytes:
         voice=voice,
         audio_config=audio_config,
     )
-    return response.audio_content  # raw PCM (LINEAR16)
+    return response.audio_content
 
 
 def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
-    """Wrap raw PCM bytes in a WAV container."""
     buf = BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
 
 
 def concatenate_wavs(wav_list: list, pause_ms: int = 500, sample_rate: int = 24000) -> bytes:
-    """Stitch WAV chunks together with a short silence between turns."""
     silence_frames = int(sample_rate * pause_ms / 1000)
     silence_pcm    = b"\x00\x00" * silence_frames
-
     all_frames = b""
     for wav_bytes in wav_list:
         buf = BytesIO(wav_bytes)
         with wave.open(buf, "rb") as wf:
             all_frames += wf.readframes(wf.getnframes())
         all_frames += silence_pcm
-
     out = BytesIO()
     with wave.open(out, "wb") as wf:
         wf.setnchannels(1)
@@ -391,13 +320,10 @@ def concatenate_wavs(wav_list: list, pause_ms: int = 500, sample_rate: int = 240
 
 
 def wav_to_mp3(wav_bytes: bytes) -> bytes:
-    """Convert WAV bytes → MP3 bytes using ffmpeg (must be installed on VM)."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_in:
         tmp_in.write(wav_bytes)
         in_path = tmp_in.name
-
     out_path = in_path.replace(".wav", ".mp3")
-
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-i", in_path, "-codec:a", "libmp3lame", "-qscale:a", "2", out_path],
@@ -414,52 +340,21 @@ def wav_to_mp3(wav_bytes: bytes) -> bytes:
 
 
 def build_audio(turns: list) -> bytes:
-    """
-    Run TTS for every dialogue turn and stitch into a single MP3.
-    Returns MP3 bytes.
-    """
     tts_client = get_tts_client()
     wav_chunks = []
-
     for i, turn in enumerate(turns):
         speaker = turn["speaker"]
         text    = turn["text"]
-        voice   = FEMALE_VOICE if speaker == "小梅" else MALE_VOICE
+        voice   = FEMALE_VOICE if speaker == "Elena" else MALE_VOICE
         log.info(f"[TTS] turn {i+1}/{len(turns)} — {speaker} ({voice})")
         try:
-            pcm  = synthesize_turn(text, voice, tts_client)
-            wav  = pcm_to_wav(pcm)
-            wav_chunks.append(wav)
+            pcm = synthesize_turn(text, voice, tts_client)
+            wav_chunks.append(pcm_to_wav(pcm))
         except Exception as e:
-            log.error(f"TTS failed for turn {i+1}: {e}")
+            log.error(f"TTS failed turn {i+1}: {e}")
         time.sleep(0.3)
-
-    combined_wav = concatenate_wavs(wav_chunks, pause_ms=600)
-    return wav_to_mp3(combined_wav)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — Save collocation to Google Sheet
-# ══════════════════════════════════════════════════════════════════════════════
-
-def save_collocation(chinese: str, english: str) -> bool:
-    """Append a row to the Chinese sheet: col A = Chinese, col B = English, col C = date."""
-    try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds  = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
-        ss     = client.open_by_url(SPREADSHEET_URL)
-        ws     = ss.worksheet(SHEET_NAME)
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        ws.append_row([chinese, english, date_str], value_input_option="USER_ENTERED")
-        log.info(f"[Sheet] saved: {chinese} | {english} | {date_str}")
-        return True
-    except Exception as e:
-        log.error(f"[Sheet] save failed: {e}")
-        return False
+    combined = concatenate_wavs(wav_chunks, pause_ms=600)
+    return wav_to_mp3(combined)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -467,94 +362,82 @@ def save_collocation(chinese: str, english: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOPIC_LABELS = {
-    "economic": "📈 经济 Economic",
-    "political": "🌐 政治 Political",
-    "china":    "🇨🇳 中国 China",
-    "egypt":    "🇪🇬 埃及 Egypt",
+    "economic": "📈 Economía",
+    "political": "🌐 Geopolítica",
+    "china":    "🇨🇳 China",
+    "egypt":    "🇪🇬 Egipto",
+    "spain":    "🇪🇸 España",
+    "usa":      "🇺🇸 Estados Unidos",
 }
 
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 ¡Hola! Envía /news para generar un podcast de noticias en español (nivel B2)."
+    )
+
+
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /news — show topic selection buttons."""
     keyboard = [
         [InlineKeyboardButton(TOPIC_LABELS["economic"],  callback_data="topic:economic")],
         [InlineKeyboardButton(TOPIC_LABELS["political"], callback_data="topic:political")],
         [InlineKeyboardButton(TOPIC_LABELS["china"],     callback_data="topic:china")],
         [InlineKeyboardButton(TOPIC_LABELS["egypt"],     callback_data="topic:egypt")],
+        [InlineKeyboardButton(TOPIC_LABELS["spain"],     callback_data="topic:spain")],
+        [InlineKeyboardButton(TOPIC_LABELS["usa"],       callback_data="topic:usa")],
     ]
     await update.message.reply_text(
-        "🎙 选择今天的播客主题 / Choose a podcast topic:",
+        "🎙 Elige el tema del podcast de hoy:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 你好！发送 /news 来生成一个新闻播客。\n"
-        "Send /news to generate a Mandarin news podcast."
-    )
-
-
 async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Called when user taps a topic button.
-    Runs the full pipeline: scrape → vocab → script → TTS → send.
-    """
     query = update.callback_query
     await query.answer()
 
     if not query.data.startswith("topic:"):
         return
 
-    topic    = query.data.split(":", 1)[1]
-    chat_id  = query.message.chat_id
-    label    = TOPIC_LABELS.get(topic, topic)
+    topic   = query.data.split(":", 1)[1]
+    chat_id = query.message.chat_id
+    label   = TOPIC_LABELS.get(topic, topic)
 
     status_msg = await query.message.reply_text(
-        f"⏳ 正在为您准备《{label}》播客，请稍候...\n(Fetching news & generating script...)"
+        f"⏳ Preparando el podcast «{label}»... (obteniendo noticias)"
     )
 
     try:
-        # 1. Fetch headlines
-        await status_msg.edit_text(f"📰 正在获取最新新闻... ({label})")
+        await status_msg.edit_text(f"📰 Obteniendo titulares... ({label})")
         headlines = await asyncio.get_event_loop().run_in_executor(
             None, fetch_headlines, topic, 5
         )
         if not headlines:
-            await status_msg.edit_text("❌ 未能获取新闻，请稍后再试。")
+            await status_msg.edit_text("❌ No se pudieron obtener noticias. Inténtalo más tarde.")
             return
-        log.info(f"[{topic}] Got {len(headlines)} headlines")
+        log.info(f"[{topic}] {len(headlines)} headlines")
 
-        # 2. Fetch vocab
-        await status_msg.edit_text("📚 正在从词汇表获取生词...")
-        vocab = await asyncio.get_event_loop().run_in_executor(
-            None, fetch_vocab_from_sheet, 8
-        )
-
-        # 3. Generate script
-        await status_msg.edit_text("✍️ 正在生成播客脚本 (DeepSeek)...")
+        await status_msg.edit_text("✍️ Generando guion (DeepSeek)...")
         script_data = await asyncio.get_event_loop().run_in_executor(
-            None, generate_script, topic, headlines, vocab
+            None, generate_script, topic, headlines
         )
 
-        turns        = script_data.get("turns", [])
+        turns         = script_data.get("turns", [])
         episode_title = script_data.get("title", label)
-        collocations = script_data.get("collocations", [])
+        collocations  = script_data.get("collocations", [])
 
         if not turns:
-            await status_msg.edit_text("❌ 脚本生成失败，请重试。")
+            await status_msg.edit_text("❌ Error al generar el guion. Inténtalo de nuevo.")
             return
-        log.info(f"[{topic}] Script: {len(turns)} turns, title: {episode_title}")
+        log.info(f"[{topic}] {len(turns)} turns — {episode_title}")
 
-        # 4. TTS
-        await status_msg.edit_text("🔊 正在合成语音，请稍候（约1-2分钟）...")
+        await status_msg.edit_text("🔊 Sintetizando audio (~1-2 min)...")
         mp3_bytes = await asyncio.get_event_loop().run_in_executor(
             None, build_audio, turns
         )
 
-        # 5. Send MP3
         await status_msg.delete()
-        caption = f"🎙 {episode_title}\n小梅 & 大明 — {label} 播客"
+        caption = f"🎙 {episode_title}\nElena & Marcos — {label}"
         await context.bot.send_audio(
             chat_id=chat_id,
             audio=mp3_bytes,
@@ -562,36 +445,30 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=caption,
         )
 
-        # 6. Build collocation buttons (stacked: Chinese on top, English below)
+        # Collocation buttons — Spanish on top row, English below
         if collocations:
             PENDING_COLLOCATIONS[chat_id] = collocations
             keyboard = []
             for idx, col in enumerate(collocations[:5]):
-                zh   = col.get("chinese", "")
-                en   = col.get("english", "")
-                # Two rows per collocation: Chinese button + English label button
-                keyboard.append([
-                    InlineKeyboardButton(zh, callback_data=f"col:{idx}"),
-                ])
-                keyboard.append([
-                    InlineKeyboardButton(en, callback_data=f"col:{idx}"),
-                ])
+                sp = col.get("spanish", "")
+                en = col.get("english", "")
+                keyboard.append([InlineKeyboardButton(sp, callback_data=f"col:{idx}")])
+                keyboard.append([InlineKeyboardButton(en, callback_data=f"col:{idx}")])
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="💾 点击搭配保存到词汇表 / Tap a collocation to save it:",
+                text="📌 Colocaciones del episodio — toca para guardar:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
 
     except Exception as e:
         log.error(f"Pipeline error: {e}", exc_info=True)
         try:
-            await status_msg.edit_text(f"❌ 出错了: {e}")
+            await status_msg.edit_text(f"❌ Error: {e}")
         except Exception:
             pass
 
 
 async def handle_collocation_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle collocation save button taps."""
     query   = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
@@ -603,36 +480,28 @@ async def handle_collocation_button(update: Update, context: ContextTypes.DEFAUL
         idx  = int(query.data.split(":", 1)[1])
         cols = PENDING_COLLOCATIONS.get(chat_id, [])
         if not cols or idx >= len(cols):
-            await query.answer("⚠️ 数据已过期，请重新生成播客。", show_alert=True)
+            await query.answer("⚠️ Datos caducados. Genera un nuevo podcast.", show_alert=True)
             return
 
         col     = cols[idx]
-        chinese = col.get("chinese", "")
+        spanish = col.get("spanish", "")
         english = col.get("english", "")
 
-        success = await asyncio.get_event_loop().run_in_executor(
-            None, save_collocation, chinese, english
-        )
-
-        if success:
-            await query.answer(f"✅ 已保存：{chinese}", show_alert=False)
-            # Update button text to show it's saved
-            # Rebuild keyboard marking saved items
-            cols_updated = PENDING_COLLOCATIONS.get(chat_id, [])
-            keyboard = []
-            for i, c in enumerate(cols_updated[:5]):
-                zh = c.get("chinese", "")
-                en = c.get("english", "")
-                saved_mark = " ✅" if i == idx else ""
-                keyboard.append([InlineKeyboardButton(zh + saved_mark, callback_data=f"col:{i}")])
-                keyboard.append([InlineKeyboardButton(en + saved_mark, callback_data=f"col:{i}")])
-            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await query.answer("❌ 保存失败，请检查 Google Sheets 配置。", show_alert=True)
+        # Mark as saved in the keyboard
+        cols_updated = PENDING_COLLOCATIONS.get(chat_id, [])
+        keyboard = []
+        for i, c in enumerate(cols_updated[:5]):
+            sp = c.get("spanish", "")
+            en = c.get("english", "")
+            mark = " ✅" if i == idx else ""
+            keyboard.append([InlineKeyboardButton(sp + mark, callback_data=f"col:{i}")])
+            keyboard.append([InlineKeyboardButton(en + mark, callback_data=f"col:{i}")])
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.answer(f"✅ {spanish} — {english}", show_alert=False)
 
     except Exception as e:
         log.error(f"Collocation button error: {e}")
-        await query.answer("❌ 出错了。", show_alert=True)
+        await query.answer("❌ Error.", show_alert=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -641,13 +510,11 @@ async def handle_collocation_button(update: Update, context: ContextTypes.DEFAUL
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("news",  cmd_news))
     app.add_handler(CallbackQueryHandler(handle_topic,              pattern=r"^topic:"))
     app.add_handler(CallbackQueryHandler(handle_collocation_button, pattern=r"^col:"))
-
-    log.info("✅ vocab-news-bot running. Send /news to generate a podcast.")
+    log.info("✅ Spanish news podcast bot running. Send /news.")
     app.run_polling()
 
 
