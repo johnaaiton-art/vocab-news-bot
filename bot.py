@@ -49,35 +49,68 @@ FEMALE_VOICE = "es-US-Chirp3-HD-Aoede"   # female, warm
 MALE_VOICE   = "es-US-Chirp3-HD-Puck"    # male, energetic
 
 # ── RSS feeds per topic ────────────────────────────────────────────────────
+# Sources: Al Jazeera, SCMP, Daily Sabah, The Hindu, plus specialist feeds
 RSS_FEEDS = {
     "economic": [
-        "https://feeds.bbci.co.uk/news/business/rss.xml",
-        "https://feeds.reuters.com/reuters/businessNews",
-        "https://rss.nytimes.com/services/xml/rss/nyt/Economy.xml",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.scmp.com/rss/2/feed",
+        "https://www.dailysabah.com/rss/economy",
     ],
     "political": [
-        "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "https://feeds.reuters.com/Reuters/worldNews",
-        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.scmp.com/rss/2/feed",
+        "https://www.dailysabah.com/rss/world",
     ],
     "china": [
-        "https://feeds.bbci.co.uk/news/world/asia/rss.xml",
-        "https://feeds.reuters.com/reuters/CNtopNews",
-        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "https://www.scmp.com/rss/2/feed",
+        "https://www.scmp.com/rss/4/feed",
+        "https://www.aljazeera.com/xml/rss/all.xml",
     ],
     "egypt": [
-        "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml",
-        "https://feeds.reuters.com/Reuters/worldNews",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.dailysabah.com/rss/world",
+        "https://www.scmp.com/rss/2/feed",
     ],
     "spain": [
-        "https://feeds.bbci.co.uk/news/world/europe/rss.xml",
-        "https://feeds.reuters.com/Reuters/worldNews",
-        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.dailysabah.com/rss/world",
+        "https://www.scmp.com/rss/2/feed",
     ],
     "usa": [
-        "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml",
-        "https://feeds.reuters.com/reuters/topNews",
-        "https://rss.nytimes.com/services/xml/rss/nyt/US.xml",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.dailysabah.com/rss/world",
+        "https://www.scmp.com/rss/2/feed",
+    ],
+    "australia": [
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.scmp.com/rss/4/feed",
+        "https://www.dailysabah.com/rss/world",
+    ],
+    "latam": [
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.scmp.com/rss/2/feed",
+        "https://www.dailysabah.com/rss/world",
+    ],
+    "turkey": [
+        "https://www.dailysabah.com/rss/world",
+        "https://www.dailysabah.com/rss/economy",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+    ],
+    "india": [
+        "https://www.thehindu.com/news/national/feeder/default.rss",
+        "https://www.thehindu.com/news/international/feeder/default.rss",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.scmp.com/rss/4/feed",
+    ],
+    "middleeast": [
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.dailysabah.com/rss/world",
+        "https://www.scmp.com/rss/2/feed",
+    ],
+    "ai": [
+        "https://www.artificialintelligence-news.com/feed/",
+        "https://venturebeat.com/category/ai/feed/",
+        "https://www.scmp.com/rss/2/feed",
     ],
 }
 
@@ -109,10 +142,16 @@ def fetch_headlines(topic: str, max_stories: int = 5) -> list:
     seen_titles = set()
 
     keyword_map = {
-        "china": ["china", "chinese", "beijing", "xi ", "taiwan", "hong kong"],
-        "egypt": ["egypt", "egyptian", "cairo", "nile"],
-        "spain": ["spain", "spanish", "madrid", "barcelona", "pedro sanchez", "iberia"],
-        "usa":   ["trump", "united states", "congress", "washington", "american", "white house"],
+        "china":      ["china", "chinese", "beijing", "xi ", "taiwan", "hong kong"],
+        "egypt":      ["egypt", "egyptian", "cairo", "nile"],
+        "spain":      ["spain", "spanish", "madrid", "barcelona", "sanchez", "iberia"],
+        "usa":        ["trump", "united states", "congress", "washington", "american", "white house"],
+        "australia":  ["australia", "australian", "sydney", "melbourne", "canberra", "albanese"],
+        "latam":      ["latin america", "brazil", "mexico", "argentina", "colombia", "venezuela", "chile", "peru", "cuba"],
+        "turkey":     ["turkey", "turkish", "erdogan", "ankara", "istanbul", "lira"],
+        "india":      ["india", "indian", "modi", "delhi", "mumbai", "pakistan", "kashmir"],
+        "middleeast": ["middle east", "israel", "gaza", "iran", "saudi", "lebanon", "syria", "iraq", "yemen", "qatar", "kuwait"],
+        "ai":         ["artificial intelligence", "ai model", "chatgpt", "deepseek", "gemini", "claude", "llm", "openai", "anthropic", "mistral", "grok", "language model", "machine learning"],
     }
 
     for url in RSS_FEEDS.get(topic, []):
@@ -176,6 +215,32 @@ TOPIC_INSTRUCTIONS = {
     ),
     "usa": (
         "Cubre la noticia más importante de los Estados Unidos hoy: política, economía o sociedad."
+    ),
+    "australia": (
+        "Cubre las últimas noticias de Australia: política, economía, relaciones con Asia o sociedad."
+    ),
+    "latam": (
+        "Cubre las noticias más importantes de América Latina: política, economía, conflictos sociales "
+        "o relaciones regionales. Puede ser de cualquier país latinoamericano."
+    ),
+    "turkey": (
+        "Cubre las últimas noticias de Turquía: política interior, economía, papel en Oriente Medio "
+        "o relaciones con la OTAN y Rusia."
+    ),
+    "india": (
+        "Cubre las últimas noticias de India: política, economía, relaciones con China y Pakistán, "
+        "o tecnología y sociedad."
+    ),
+    "middleeast": (
+        "Cubre las noticias más importantes de Oriente Medio: conflictos, diplomacia, petróleo, "
+        "o cambios políticos en la región."
+    ),
+    "ai": (
+        "Cubre los últimos avances en inteligencia artificial — SOLO aspectos técnicos y de capacidades: "
+        "nuevos modelos lanzados (incluyendo modelos chinos como DeepSeek, Qwen, etc.), "
+        "nuevas funcionalidades, comparaciones entre modelos, lo que ahora es posible hacer con IA "
+        "que antes no lo era. NO hables de inversiones, valoraciones ni dinero. "
+        "El enfoque es: ¿qué puede hacer la IA ahora que no podía hacer antes?"
     ),
 }
 
@@ -391,12 +456,18 @@ def build_audio(turns: list) -> bytes:
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOPIC_LABELS = {
-    "economic": "📈 Economía",
-    "political": "🌐 Geopolítica",
-    "china":    "🇨🇳 China",
-    "egypt":    "🇪🇬 Egipto",
-    "spain":    "🇪🇸 España",
-    "usa":      "🇺🇸 Estados Unidos",
+    "economic":   "📈 Economía",
+    "political":  "🌐 Geopolítica",
+    "china":      "🇨🇳 China",
+    "egypt":      "🇪🇬 Egipto",
+    "spain":      "🇪🇸 España",
+    "usa":        "🇺🇸 Estados Unidos",
+    "australia":  "🦘 Australia",
+    "latam":      "🌎 América Latina",
+    "turkey":     "🇹🇷 Turquía",
+    "india":      "🇮🇳 India",
+    "middleeast": "🕌 Oriente Medio",
+    "ai":         "🤖 Inteligencia Artificial",
 }
 
 
@@ -408,12 +479,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton(TOPIC_LABELS["economic"],  callback_data="topic:economic")],
-        [InlineKeyboardButton(TOPIC_LABELS["political"], callback_data="topic:political")],
-        [InlineKeyboardButton(TOPIC_LABELS["china"],     callback_data="topic:china")],
-        [InlineKeyboardButton(TOPIC_LABELS["egypt"],     callback_data="topic:egypt")],
-        [InlineKeyboardButton(TOPIC_LABELS["spain"],     callback_data="topic:spain")],
-        [InlineKeyboardButton(TOPIC_LABELS["usa"],       callback_data="topic:usa")],
+        [InlineKeyboardButton(TOPIC_LABELS["economic"],   callback_data="topic:economic"),
+         InlineKeyboardButton(TOPIC_LABELS["political"],  callback_data="topic:political")],
+        [InlineKeyboardButton(TOPIC_LABELS["china"],      callback_data="topic:china"),
+         InlineKeyboardButton(TOPIC_LABELS["india"],      callback_data="topic:india")],
+        [InlineKeyboardButton(TOPIC_LABELS["usa"],        callback_data="topic:usa"),
+         InlineKeyboardButton(TOPIC_LABELS["latam"],      callback_data="topic:latam")],
+        [InlineKeyboardButton(TOPIC_LABELS["middleeast"], callback_data="topic:middleeast"),
+         InlineKeyboardButton(TOPIC_LABELS["egypt"],      callback_data="topic:egypt")],
+        [InlineKeyboardButton(TOPIC_LABELS["turkey"],     callback_data="topic:turkey"),
+         InlineKeyboardButton(TOPIC_LABELS["spain"],      callback_data="topic:spain")],
+        [InlineKeyboardButton(TOPIC_LABELS["australia"],  callback_data="topic:australia"),
+         InlineKeyboardButton(TOPIC_LABELS["ai"],         callback_data="topic:ai")],
     ]
     await update.message.reply_text(
         "🎙 Elige el tema del podcast de hoy:",
