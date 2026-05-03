@@ -1,0 +1,7 @@
+python-telegram-bot==20.7
+openai>=1.14.0
+feedparser==6.0.11
+gspread==6.1.2
+google-auth==2.29.0
+google-cloud-texttospeech==2.16.3
+requests>=2.31.0

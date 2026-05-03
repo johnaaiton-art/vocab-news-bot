@@ -1,0 +1,7 @@
+.env
+google-creds.json
+__pycache__/
+*.pyc
+venv/
+*.mp3
+*.wav
