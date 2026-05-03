@@ -180,25 +180,32 @@ TOPIC_INSTRUCTIONS = {
 }
 
 PODCAST_SYSTEM_PROMPT = """Eres un guionista de podcasts en español.
-Escribes conversaciones animadas y naturales para dos presentadores:
-- Elena — presentadora femenina, cálida y curiosa
-- Marcos — presentador masculino, tranquilo y analítico
+Escribes conversaciones animadas y naturales para dos presentadores que llevan años trabajando juntos y tienen una química innegable:
+- Elena — presentadora femenina, inteligente y con mucho carácter. Le gusta provocar a Marcos con comentarios irónicos y sabe exactamente cómo sacarle de quicio. Pero también le admira, aunque nunca lo admita del todo.
+- Marcos — presentador masculino, seguro de sí mismo y con sentido del humor seco. Le encanta picar a Elena y coquetear sutilmente con ella. Se toma las noticias en serio pero no se toma a sí mismo demasiado en serio.
+
+SU DINÁMICA:
+- Se hacen comentarios irónicos el uno al otro mientras dan las noticias. Pequeños piques, bromas internas, miradas cómplices que se notan en el tono.
+- Hay una tensión coqueta sutil — no cursi ni exagerada, solo la química natural de dos personas que se gustan y lo saben.
+- Se interrumpen de vez en cuando, se corrigen con cariño, se ríen de algo que dijo el otro.
+- Ejemplos del tipo de intercambio:
+    Elena: "...y según los analistas, la situación podría empeorar."
+    Marcos: "¿Ves? Por eso yo nunca invierto en bolsa. Tú tampoco deberías, Elena."
+    Elena: "Marcos, tú no inviertes porque gastas todo en café."
+- O:
+    Marcos: "Bueno, esto lo explico yo porque sé que a ti la geopolítica te da sueño."
+    Elena: "Me da sueño cuando la explicas tú, que no es lo mismo."
+- Que fluya natural — no forzado, no cada turno, pero sí repartido por todo el episodio.
 
 REGLAS DE IDIOMA:
 - TODO el guion en español (nivel B2 — fluido pero accesible).
 - Vocabulario variado y natural. Nada de lenguaje excesivamente técnico sin explicación.
 - Si un concepto es complejo, uno de los presentadores lo explica brevemente con palabras más simples, en español.
-- No uses inglés salvo para la primera presentación de un nombre propio como se indica abajo.
 
 REGLAS DE NOMBRES:
 - Nombres de personas: SOLO se puede decir "Trump" y "Putin" por su nombre.
   Para los demás usa el cargo: "el presidente de Egipto", "el CEO de NVIDIA", etc.
-- La primera vez que se menciona un país o empresa importante: di el nombre en español,
-  luego el nombre en inglés entre paréntesis, y a partir de entonces solo en español.
-  Ej: "China (China)..." y de ahí en adelante solo "China".
-- Países permitidos por nombre: Estados Unidos, Reino Unido, Francia, Alemania, Rusia,
-  Ucrania, China, Irán, Canadá, Australia, España, Italia, Egipto.
-  Otros países: descríbelos brevemente en lugar de usar un nombre poco conocido.
+- Países y empresas: usa sus nombres en español directamente, sin introducirlos en inglés.
 
 FORMATO DE SALIDA — solo JSON válido, sin marcadores markdown:
 {
@@ -301,14 +308,36 @@ def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
     return buf.getvalue()
 
 
-def concatenate_wavs(wav_list: list, pause_ms: int = 500, sample_rate: int = 24000) -> bytes:
+def fade_pcm(pcm_bytes: bytes, fade_ms: int = 15, sample_rate: int = 24000) -> bytes:
+    """Apply a short linear fade-in and fade-out to raw 16-bit mono PCM to kill boundary clicks."""
+    import struct
+    fade_frames = int(sample_rate * fade_ms / 1000)
+    n_frames    = len(pcm_bytes) // 2
+    if n_frames < fade_frames * 2:
+        return pcm_bytes  # too short to fade safely
+
+    samples = list(struct.unpack(f"<{n_frames}h", pcm_bytes))
+
+    # fade in
+    for i in range(fade_frames):
+        samples[i] = int(samples[i] * i / fade_frames)
+    # fade out
+    for i in range(fade_frames):
+        idx = n_frames - fade_frames + i
+        samples[idx] = int(samples[idx] * (fade_frames - i) / fade_frames)
+
+    return struct.pack(f"<{n_frames}h", *samples)
+
+
+def concatenate_wavs(wav_list: list, pause_ms: int = 600, sample_rate: int = 24000) -> bytes:
     silence_frames = int(sample_rate * pause_ms / 1000)
     silence_pcm    = b"\x00\x00" * silence_frames
     all_frames = b""
     for wav_bytes in wav_list:
         buf = BytesIO(wav_bytes)
         with wave.open(buf, "rb") as wf:
-            all_frames += wf.readframes(wf.getnframes())
+            raw = wf.readframes(wf.getnframes())
+        all_frames += fade_pcm(raw)
         all_frames += silence_pcm
     out = BytesIO()
     with wave.open(out, "wb") as wf:
