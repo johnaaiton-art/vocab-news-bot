@@ -1,1057 +1,746 @@
+"""
+vocab_news_bot/bot.py  —  Spanish B2 News Podcast Bot (v2)
+
+Flow:
+  /news
+    → Step 1: choose COUNTRY  (Argentina / Rusia / Turquía / China / USA)
+    → Step 2: choose SUBTOPIC (Medicina / Psicología / Tango / Cultura / Economía / IA)
+    → Bot sends 3 comprehension questions as text  ← BEFORE audio
+    → Bot generates & sends MP3  (~5-6 min, Elena & Marcos, B2, very enthusiastic)
+    → Bot sends 10 collocation buttons (Spanish / English stacked)
+      → tap to save → Google Sheet, tab = Telegram username (auto-created)
+    → Bot sends HTML file with colour-coded transcript
+"""
+
 import os
-import json
-import hashlib
 import re
-import zipfile
+import json
 import time
-from datetime import datetime
-from collections import defaultdict
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from openai import OpenAI
-from google.cloud import texttospeech
-from google.oauth2 import service_account
+import wave
+import struct
+import logging
 import asyncio
+import tempfile
+import subprocess
 from io import BytesIO
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from datetime import datetime
 
-# Environment variables - SAFE FOR GITHUB/RAILWAY
+import feedparser
+import gspread
+from openai import OpenAI
+from google.oauth2.service_account import Credentials
+from google.cloud import texttospeech
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes,
+)
+
+# ── Env vars ───────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+DEEPSEEK_API_KEY   = os.getenv("DEEPSEEK_API_KEY")
 
-# Configuration
-class Config:
-    MAX_TOPIC_LENGTH = 100
-    MAX_VOCAB_ITEMS = 15
-    TTS_TIMEOUT = 30
-    API_RETRY_ATTEMPTS = 3
-    RATE_LIMIT_REQUESTS = 5
-    RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
-    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB for Telegram
+if not TELEGRAM_BOT_TOKEN or not DEEPSEEK_API_KEY:
+    raise EnvironmentError("TELEGRAM_BOT_TOKEN and DEEPSEEK_API_KEY must be set.")
 
-config = Config()
+# ── Google ─────────────────────────────────────────────────────────────────
+GOOGLE_CREDS_FILE = os.path.join(os.path.dirname(__file__), "google-creds.json")
+SPREADSHEET_URL   = "https://docs.google.com/spreadsheets/d/1H-ezqh5Vcl3_6YWJIy9KvgpDCsM3V6N4LJq0dqNbJS0/edit"
 
-# Initialize DeepSeek client
-deepseek_client = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
-)
+# ── TTS voices ─────────────────────────────────────────────────────────────
+FEMALE_VOICE = "es-US-Chirp3-HD-Aoede"
+MALE_VOICE   = "es-US-Chirp3-HD-Puck"
 
-# Rate Limiter
-class RateLimiter:
-    def __init__(self, max_requests=5, window=3600):
-        self.requests = defaultdict(list)
-        self.max_requests = max_requests
-        self.window = window
-    
-    def is_allowed(self, user_id):
-        now = time.time()
-        user_requests = self.requests[user_id]
-        
-        # Remove old requests outside the time window
-        user_requests[:] = [req_time for req_time in user_requests 
-                          if now - req_time < self.window]
-        
-        if len(user_requests) >= self.max_requests:
-            return False
-        
-        user_requests.append(now)
-        return True
-    
-    def get_reset_time(self, user_id):
-        """Get time until rate limit resets"""
-        if not self.requests[user_id]:
-            return 0
-        oldest_request = min(self.requests[user_id])
-        reset_time = oldest_request + self.window - time.time()
-        return max(0, int(reset_time))
+# ── DeepSeek ───────────────────────────────────────────────────────────────
+ds_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-rate_limiter = RateLimiter(
-    max_requests=config.RATE_LIMIT_REQUESTS,
-    window=config.RATE_LIMIT_WINDOW
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-def get_google_tts_client():
-    """Initialize Google TTS client with credentials from environment variable"""
-    if GOOGLE_CREDENTIALS_JSON:
-        credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        credentials = service_account.Credentials.from_service_account_info(
-            credentials_dict,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-        return texttospeech.TextToSpeechClient(credentials=credentials)
-    else:
-        return texttospeech.TextToSpeechClient()
+# ── In-memory state (per chat_id) ──────────────────────────────────────────
+PENDING_COLLOCATIONS: dict = {}
 
-def validate_topic(topic):
-    """Validate and sanitize topic input"""
-    # Remove excessive whitespace
-    topic = re.sub(r'\s+', ' ', topic.strip())
-    
-    # Check for harmful patterns (command injection, path traversal)
-    if re.search(r'[<>"|&;`$()]', topic):
-        raise ValueError("Topic contains invalid characters")
-    
-    # Basic content moderation (Chinese and English)
-    inappropriate_patterns = [
-        r'\b(porn|sex|violence|hate|kill|death)\b',
-        r'\b(暴力|色情|仇恨|歧视|杀|死)\b',
-    ]
-    
-    for pattern in inappropriate_patterns:
-        if re.search(pattern, topic, re.IGNORECASE):
-            raise ValueError("Topic contains inappropriate content")
-    
-    # Enforce length limit
-    if len(topic) > config.MAX_TOPIC_LENGTH:
-        topic = topic[:config.MAX_TOPIC_LENGTH]
-    
-    if not topic:
-        raise ValueError("Topic cannot be empty")
-    
-    return topic
 
-def split_text_into_sentences(text, max_length=150):
-    """Split text into smaller sentences for Chirp3"""
-    sentences = re.split(r'([。！？；])', text)
-    
-    result = []
-    for i in range(0, len(sentences)-1, 2):
-        if i+1 < len(sentences):
-            result.append(sentences[i] + sentences[i+1])
-        else:
-            result.append(sentences[i])
-    
-    final_result = []
-    for sentence in result:
-        if len(sentence) > max_length:
-            parts = re.split(r'([，、])', sentence)
-            temp = ""
-            for part in parts:
-                if len(temp + part) > max_length and temp:
-                    final_result.append(temp)
-                    temp = part
-                else:
-                    temp += part
-            if temp:
-                final_result.append(temp)
-        else:
-            final_result.append(sentence)
-    
-    return [s.strip() for s in final_result if s.strip()]
+# ══════════════════════════════════════════════════════════════════════════════
+# MENU LABELS
+# ══════════════════════════════════════════════════════════════════════════════
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=2, max=5),
-    retry=retry_if_exception_type(Exception)
-)
-def generate_tts_chirp_sync(text):
-    """Generate Chinese TTS audio using Google Cloud Chirp3 (sync version)"""
-    try:
-        client = get_google_tts_client()
-        
-        sentences = split_text_into_sentences(text, max_length=150)
-        
-        all_audio = b""
-        for sentence in sentences:
-            synthesis_input = texttospeech.SynthesisInput(text=sentence)
-            voice = texttospeech.VoiceSelectionParams(
-                language_code="cmn-CN",
-                name="cmn-CN-Chirp3-HD-Aoede",
-                ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
-            )
-            
-            audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.MP3
-            )
-            
-            response = client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config
-            )
-            
-            all_audio += response.audio_content
-        
-        return all_audio
-    
-    except Exception as e:
-        print(f"Chirp3 TTS Error: {str(e)}")
-        # Try fallback to Wavenet
-        return generate_tts_wavenet_sync(text)
+COUNTRY_LABELS = {
+    "argentina": "🇦🇷 Argentina",
+    "rusia":     "🇷🇺 Rusia",
+    "turquia":   "🇹🇷 Turquía",
+    "china":     "🇨🇳 China",
+    "usa":       "🇺🇸 Estados Unidos",
+}
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=2, max=5),
-    retry=retry_if_exception_type(Exception)
-)
-def generate_tts_wavenet_sync(text):
-    """Fallback TTS using Wavenet (sync version)"""
-    try:
-        client = get_google_tts_client()
-        
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="cmn-CN",
-            name="cmn-CN-Wavenet-A",
-            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
-        )
-        
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=0.8,
-        )
-        
-        response = client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
-        
-        return response.audio_content
-    
-    except Exception as e:
-        print(f"Wavenet TTS Error: {str(e)}")
-        return None
+SUBTOPIC_LABELS = {
+    "medicina":   "🏥 Medicina",
+    "psicologia": "🧠 Psicología",
+    "tango":      "💃 Tango",
+    "cultura":    "🎭 Cultura",
+    "economia":   "📈 Economía",
+    "ia":         "🤖 Inteligencia Artificial",
+}
 
-async def generate_tts_async(text, use_chirp=True):
-    """Run TTS generation in thread pool"""
-    loop = asyncio.get_event_loop()
-    if use_chirp:
-        return await loop.run_in_executor(None, generate_tts_chirp_sync, text)
-    else:
-        return await loop.run_in_executor(None, generate_tts_wavenet_sync, text)
 
-def safe_filename(filename):
-    """Sanitize filename to prevent path traversal (ZIP slip vulnerability)"""
-    # Remove path separators and dangerous characters
-    filename = re.sub(r'[^\w\s.-]', '', filename)
-    filename = filename.replace('..', '').replace('/', '').replace('\\', '')
-    # Get just the basename to strip any path components
-    filename = os.path.basename(filename)
-    # Ensure reasonable length
-    filename = filename[:100]
-    return filename.strip('_')
+# ══════════════════════════════════════════════════════════════════════════════
+# RSS FEEDS  (Al Jazeera · SCMP · Daily Sabah · AI News — no NATO-bias outlets)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def validate_deepseek_response(content):
-    """Validate DeepSeek JSON response structure"""
-    required_keys = ["main_text", "vocabulary", "opinion_texts", "discussion_questions"]
-    
-    # Check all required keys exist
-    if not all(k in content for k in required_keys):
-        missing = [k for k in required_keys if k not in content]
-        raise ValueError(f"Missing required keys in DeepSeek response: {missing}")
-    
-    # Validate vocabulary is a list
-    if not isinstance(content['vocabulary'], list):
-        raise ValueError("vocabulary must be a list")
-    
-    # Limit vocabulary items
-    if len(content['vocabulary']) > config.MAX_VOCAB_ITEMS:
-        content['vocabulary'] = content['vocabulary'][:config.MAX_VOCAB_ITEMS]
-    
-    # Validate each vocabulary item has required fields
-    for item in content['vocabulary']:
-        if not all(k in item for k in ['english', 'chinese', 'pinyin']):
-            raise ValueError("Each vocabulary item must have 'english', 'chinese', 'pinyin'")
-    
-    # Validate opinion_texts has all three views
-    if not all(k in content['opinion_texts'] for k in ['positive', 'negative', 'balanced']):
-        raise ValueError("opinion_texts must have 'positive', 'negative', 'balanced'")
-    
-    # Validate discussion_questions is a list
-    if not isinstance(content['discussion_questions'], list):
-        raise ValueError("discussion_questions must be a list")
-    
-    return True
+RSS_FEEDS = {
+    "argentina": [
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.dailysabah.com/rss/world",
+        "https://www.scmp.com/rss/2/feed",
+    ],
+    "rusia": [
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.dailysabah.com/rss/world",
+        "https://www.scmp.com/rss/2/feed",
+    ],
+    "turquia": [
+        "https://www.dailysabah.com/rss/world",
+        "https://www.dailysabah.com/rss/economy",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+    ],
+    "china": [
+        "https://www.scmp.com/rss/2/feed",
+        "https://www.scmp.com/rss/4/feed",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+    ],
+    "usa": [
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.dailysabah.com/rss/world",
+        "https://www.scmp.com/rss/2/feed",
+    ],
+    "ia": [
+        "https://www.artificialintelligence-news.com/feed/",
+        "https://venturebeat.com/category/ai/feed/",
+        "https://www.scmp.com/rss/2/feed",
+    ],
+}
 
-@retry(
-    stop=stop_after_attempt(config.API_RETRY_ATTEMPTS),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type((Exception,)),
-    before_sleep=lambda retry_state: print(f"Retry attempt {retry_state.attempt_number} after error: {retry_state.outcome.exception()}")
-)
-def generate_content_with_deepseek(topic):
-    """Generate all content using DeepSeek API with retry logic"""
-    print(f"[DeepSeek] Generating content for topic: {topic[:50]}...")
-    
-    prompt = f"""You are a Chinese language teaching assistant. Create learning materials about the topic: "{topic}"
+KEYWORD_MAP = {
+    "argentina": ["argentina", "argentino", "buenos aires", "milei", "patagonia"],
+    "rusia":     ["russia", "russian", "moscow", "kremlin", "putin", "ukraine"],
+    "turquia":   ["turkey", "turkish", "erdogan", "ankara", "istanbul"],
+    "china":     ["china", "chinese", "beijing", "xi ", "taiwan", "hong kong"],
+    "usa":       ["trump", "united states", "congress", "washington", "american", "white house"],
+    "medicina":  ["health", "medicine", "medical", "hospital", "disease", "treatment", "vaccine", "therapy"],
+    "psicologia":["psychology", "mental health", "therapy", "wellbeing", "stress", "anxiety", "cognitive"],
+    "tango":     ["tango", "dance", "milonga", "buenos aires", "folklore"],
+    "cultura":   ["culture", "festival", "museum", "art", "literature", "music", "tradition", "heritage", "holiday"],
+    "economia":  ["economy", "economic", "trade", "market", "gdp", "inflation", "investment", "finance"],
+    "ia":        ["artificial intelligence", "ai model", "deepseek", "gemini", "chatgpt", "llm",
+                  "openai", "anthropic", "mistral", "grok", "language model", "machine learning", "qwen"],
+}
 
-Please generate a JSON response with the following structure:
-{{
-  "main_text": "A text in Simplified Chinese at HSK5 level about {topic}. Should be 250 characters long, natural and engaging.",
-  "vocabulary": [
-    {{"english": "English translation", "chinese": "Chinese word/phrase from the text", "pinyin": "pinyin with tone marks"}},
-    // 10-15 items total - must be HSK5 level collocations or phrases are preferable, expressions taken directly from the main_text
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FETCH HEADLINES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_headlines(country: str, subtopic: str, max_stories: int = 6) -> list:
+    import time as _time
+    cutoff   = _time.time() - 86400
+    feed_key = "ia" if subtopic == "ia" else country
+    urls     = RSS_FEEDS.get(feed_key, RSS_FEEDS["usa"])
+
+    stories, seen = [], set()
+    for url in urls:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries:
+                title = entry.get("title", "").strip()
+                if not title or title in seen:
+                    continue
+                seen.add(title)
+                pub    = entry.get("published_parsed")
+                pub_ts = _time.mktime(pub) if pub else 0
+                summary = re.sub(r"<[^>]+>", "",
+                    entry.get("summary", entry.get("description", ""))).strip()[:300]
+                stories.append({
+                    "title":   title,
+                    "summary": summary,
+                    "fresh":   pub_ts >= cutoff,
+                })
+        except Exception as e:
+            log.warning(f"RSS {url}: {e}")
+
+    fresh = [s for s in stories if s["fresh"]]
+    pool  = fresh if len(fresh) >= 2 else stories
+
+    kws = KEYWORD_MAP.get(country, []) + KEYWORD_MAP.get(subtopic, [])
+    if kws:
+        filtered = [s for s in pool if any(
+            k in s["title"].lower() or k in s["summary"].lower() for k in kws
+        )]
+        pool = filtered if filtered else pool
+
+    return pool[:max_stories]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOPIC INSTRUCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+COUNTRY_NAMES_ES = {
+    "argentina": "Argentina",
+    "rusia":     "Rusia",
+    "turquia":   "Turquía",
+    "china":     "China",
+    "usa":       "Estados Unidos",
+}
+
+
+def get_topic_instruction(country: str, subtopic: str) -> str:
+    cn = COUNTRY_NAMES_ES.get(country, country.capitalize())
+    instructions = {
+        "medicina": (
+            f"Cubre las últimas noticias sobre medicina y salud en {cn}: "
+            "avances médicos, políticas de salud pública, nuevos tratamientos o descubrimientos científicos."
+        ),
+        "psicologia": (
+            f"Cubre temas de psicología y salud mental relacionados con {cn}: "
+            "investigaciones recientes, tendencias sociales, bienestar o políticas de salud mental."
+        ),
+        "tango": (
+            "Cubre noticias sobre el tango y su mundo: "
+            "festivales, figuras destacadas, evolución del género, "
+            "su influencia cultural en Argentina y en el mundo."
+        ),
+        "cultura": (
+            f"Cubre noticias culturales de {cn}: festivales, museos, arte, literatura, música, "
+            "tradiciones, celebraciones populares, fiestas nacionales o patrimonio cultural."
+        ),
+        "economia": (
+            f"Cubre las noticias económicas más importantes de {cn}: "
+            "mercados, comercio, política económica, empresas o situación financiera."
+        ),
+        "ia": (
+            f"Cubre los últimos avances en inteligencia artificial relacionados con {cn}. "
+            "SOLO implementación y capacidades: cómo el gobierno o empresas usan IA, "
+            "startups de IA, nuevos modelos lanzados (incluyendo modelos chinos como DeepSeek, Qwen), "
+            "nuevas funcionalidades, lo que ahora es posible que antes no lo era. "
+            "NADA sobre inversiones, valoraciones bursátiles ni dinero."
+        ),
+    }
+    return instructions.get(subtopic, f"Cubre las últimas noticias sobre {cn}.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEEPSEEK — GENERATE SCRIPT
+# ══════════════════════════════════════════════════════════════════════════════
+
+PODCAST_SYSTEM_PROMPT = """\
+Eres un guionista de podcasts en español.
+Escribes guiones para dos presentadores que llevan años trabajando juntos y tienen una química eléctrica e innegable:
+
+- Elena — mujer, brillante, ingeniosa y con una energía absolutamente contagiosa. Le encanta sorprender a Marcos con datos inesperados. Tiene opiniones fuertes pero las expresa con humor. Coquetea sin darse cuenta... o quizás sí.
+- Marcos — hombre, apasionado, carismático y muy divertido. Siempre tiene un comentario inesperado que hace reír. Le encanta provocar a Elena y admira su inteligencia aunque lo disimule mal. Coquetea descaradamente.
+
+ENERGÍA Y ESTILO — ESTO ES LO MÁS IMPORTANTE:
+- Los dos son INCREÍBLEMENTE entusiastas. Hablan con energía desbordante y genuina, como si cada noticia fuera fascinante.
+- Usan exclamaciones naturales y frecuentes: "¡Espera, espera!", "¡Esto es alucinante!", "¡No me lo puedo creer!", "¡Exactamente!", "¡Qué interesante!", "¡Eso es clave!"
+- Se interrumpen con emoción, reaccionan con sorpresa real, celebran los datos buenos.
+- Dan su OPINIÓN sobre lo que cuentan — no de forma exagerada o política, sino reflexiva y personal:
+  "A mí esto me parece un cambio enorme...", "Yo creo que lo más importante aquí es...", "¿Tú no crees que esto cambia todo?"
+- Pueden estar de acuerdo o NO — el desacuerdo crea dinamismo real.
+- La tensión coqueta es sutil pero constante: "Sabía que ibas a decir eso", "Eres imposible, Marcos", "Oye, eso ha sido muy bueno — te lo reconozco."
+- El ritmo es VIVO. Frases cortas y medias. Nunca monólogos largos sin reacción del otro.
+
+REGLAS DE IDIOMA:
+- TODO en español, nivel B2. Fluido, natural, variado. Nada demasiado técnico sin explicar.
+- Si algo es complejo, uno lo explica con palabras más simples de forma natural, sin que suene a clase.
+
+REGLAS DE NOMBRES:
+- Solo "Trump" y "Putin" por su nombre. Los demás: por su cargo.
+- Países y empresas: directamente en español.
+
+FORMATO DE SALIDA — solo JSON válido, sin markdown ni texto extra antes o después:
+{
+  "title": "título del episodio en español",
+  "questions": [
+    "Pregunta de comprensión 1 sobre el contenido",
+    "Pregunta de comprensión 2",
+    "Pregunta de comprensión 3"
   ],
-  "opinion_texts": {{
-    "positive": "A natural Chinese text (HSK5 level, 100-150 characters) giving a positive perspective on the main topic. Must naturally incorporate at least 5-6 vocabulary items from the list, but adjust them to fit naturally in context. Use some of the vocabulary taken from the first text.",
-    "negative": "A natural Chinese text (HSK5 level, 100-150 characters) giving a critical/negative perspective on the main topic. Must naturally incorporate at least 5-6 vocabulary items from the list, but adjust them to fit naturally in context. Use some of the vocabulary taken from the first text.",
-    "balanced": "A natural Chinese text (HSK5 level, 100-150 characters) giving a balanced perspective on the main topic. Must naturally incorporate at least 5-6 vocabulary items from the list, but adjust them to fit naturally in context. Use some of the vocabulary taken from the first text."
-  }},
-  "discussion_questions": [
-    "Question 1 in Chinese (HSK5 level) - should prompt discussion, not just comprehension",
-    "Question 2 in Chinese (HSK5 level) - should prompt discussion, not just comprehension",
-    "Question 3 in Chinese (HSK5 level) - should prompt discussion, not just comprehension",
-    "Question 4 in Chinese (HSK5 level) - should prompt discussion, not just comprehension"
+  "turns": [
+    {"speaker": "Elena", "text": "..."},
+    {"speaker": "Marcos", "text": "..."}
+  ],
+  "collocations": [
+    {"spanish": "expresión en español", "english": "simple English translation"},
+    {"spanish": "...", "english": "..."}
   ]
-}}
+}
 
-Important requirements:
-1. All vocabulary items MUST come from the main_text
-2. Vocabulary should be HSK5 level collocations and phrases (not single words)
-3. Opinion texts should use some of the vocabulary taken from the first text but should sound natural - vocabulary can be adjusted to fit context
-4. Discussion questions should encourage personal opinions and deeper thinking
-5. Return ONLY valid JSON, no additional text"""
+PREGUNTAS: abiertas, que inviten a reflexionar sobre el contenido. En español. Nivel B2.
+
+COLOCACIONES: exactamente 10. Expresiones o colocaciones clave del episodio, 2-6 palabras en español.
+Traducción al inglés: usa la palabra MÁS SENCILLA posible — el oyente habla inglés bien pero no es nativo. Evita palabras C1/C2 en inglés.
+
+Duración objetivo: ~35-42 turnos de diálogo (5-6 minutos de audio a ritmo natural).
+"""
+
+
+def generate_script(country: str, subtopic: str, headlines: list) -> dict:
+    headline_text     = "\n".join(f"- {s['title']}: {s['summary']}" for s in headlines)
+    topic_instruction = get_topic_instruction(country, subtopic)
+    country_es        = COUNTRY_NAMES_ES.get(country, country)
+    subtopic_es       = SUBTOPIC_LABELS.get(subtopic, subtopic).split(" ", 1)[-1]
+
+    user_prompt = (
+        f"País: {country_es} | Tema: {subtopic_es}\n"
+        f"Instrucción: {topic_instruction}\n\n"
+        f"Titulares de hoy (úsalos como fuente factual):\n{headline_text}\n\n"
+        "Escribe el guion completo ahora."
+    )
+
+    log.info(f"[DeepSeek] {country}/{subtopic}")
+    resp = ds_client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": PODCAST_SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        temperature=0.7,
+        max_tokens=5000,
+    )
+
+    raw = resp.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
 
     try:
-        print(f"[DeepSeek] Sending request to API...")
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "You are a Chinese language teaching expert who creates engaging, natural content at HSK5 level. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            timeout=45.0
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        raise
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML TRANSCRIPT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_html_transcript(title: str, country: str, subtopic: str,
+                          turns: list, collocations: list) -> bytes:
+    country_es  = COUNTRY_NAMES_ES.get(country, country)
+    subtopic_es = SUBTOPIC_LABELS.get(subtopic, subtopic).split(" ", 1)[-1]
+    date_str    = datetime.now().strftime("%d %B %Y")
+
+    turns_html = ""
+    for turn in turns:
+        css  = "elena" if turn["speaker"] == "Elena" else "marcos"
+        turns_html += (
+            f'<div class="turn {css}">'
+            f'<span class="name">{turn["speaker"]}</span>'
+            f'<p>{turn["text"]}</p>'
+            f'</div>\n'
         )
-        
-        print(f"[DeepSeek] Received response, parsing...")
-        content_text = response.choices[0].message.content
-        
-        # Try to extract JSON if there's extra text
-        json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
-        if json_match:
-            content_text = json_match.group()
-        
-        # Parse JSON
-        content = json.loads(content_text)
-        
-        print(f"[DeepSeek] JSON parsed successfully")
-        
-        # Validate structure
-        validate_deepseek_response(content)
-        
-        print(f"[DeepSeek] Validation passed, returning content")
-        return content
-    
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON parsing error: {str(e)}")
-        print(f"[ERROR] Raw content: {content_text[:200]}...")
-        raise
-    except ValueError as e:
-        print(f"[ERROR] Validation error: {str(e)}")
-        raise
-    except Exception as e:
-        print(f"[ERROR] DeepSeek API Error: {type(e).__name__}: {str(e)}")
-        raise
 
-async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=None):
-    """Create tab-delimited vocabulary file with TTS audio tags and return audio files"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_topic_name = safe_filename(topic)
-    filename = f"{safe_topic_name}_{timestamp}_vocabulary.txt"
-    
-    content = ""
-    audio_files = {}
-    
-    total_items = len(vocabulary)
-    
-    # Generate TTS for all vocabulary items concurrently
-    tts_tasks = []
-    for item in vocabulary:
-        tts_tasks.append(generate_tts_async(item['chinese'], use_chirp=False))
-    
-    # Await all TTS generations
-    audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
-    
-    for idx, (item, audio_data) in enumerate(zip(vocabulary, audio_results)):
-        chinese_text = item['chinese']
-        
-        if progress_callback:
-            await progress_callback(idx + 1, total_items)
-        
-        # Check if audio generation succeeded
-        if isinstance(audio_data, Exception) or not audio_data:
-            print(f"TTS failed for '{chinese_text}': {audio_data if isinstance(audio_data, Exception) else 'No data'}")
-            # Add row without audio
-            content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
-        else:
-            # Create filename using MD5 hash
-            hash_object = hashlib.md5(chinese_text.encode())
-            audio_filename = f"tts_{hash_object.hexdigest()}.mp3"
-            
-            # Sanitize filename
-            audio_filename = safe_filename(audio_filename)
-            
-            # Store audio data
-            audio_files[audio_filename] = audio_data
-            
-            # Create Anki sound tag
-            anki_tag = f"[sound:{audio_filename}]"
-            
-            # Add row with 4 columns: english, chinese, pinyin, audio_tag
-            content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\t{anki_tag}\n"
-    
-    return filename, content, audio_files
+    col_rows = "".join(
+        f'<tr><td class="sp">{c.get("spanish","")}</td>'
+        f'<td class="en">{c.get("english","")}</td></tr>\n'
+        for c in collocations
+    )
 
-def create_zip_package(vocab_filename, vocab_content, audio_files, topic, timestamp):
-    """Create a ZIP file containing vocabulary txt and all MP3 files"""
-    safe_topic_name = safe_filename(topic)
-    zip_filename = f"{safe_topic_name}_{timestamp}_anki_package.zip"
-    zip_buffer = BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        # Sanitize vocabulary filename
-        safe_vocab_filename = safe_filename(vocab_filename)
-        
-        # Add vocabulary text file
-        zip_file.writestr(safe_vocab_filename, vocab_content.encode('utf-8'))
-        
-        # Add all audio files with sanitized names
-        for audio_filename, audio_data in audio_files.items():
-            safe_audio_filename = safe_filename(audio_filename)
-            zip_file.writestr(safe_audio_filename, audio_data)
-    
-    zip_buffer.seek(0)
-    
-    # Check file size
-    file_size = zip_buffer.getbuffer().nbytes
-    if file_size > config.MAX_FILE_SIZE:
-        raise ValueError(f"ZIP file too large: {file_size / 1024 / 1024:.1f}MB (max: {config.MAX_FILE_SIZE / 1024 / 1024}MB)")
-    
-    return zip_filename, zip_buffer
-
-
-def create_html_document(topic, content, timestamp):
-    """Create a beautiful HTML document with all learning materials"""
-    safe_topic = safe_filename(topic)
-    html_filename = f"{safe_topic}_{timestamp}_materials.html"
-    
-    # Build vocabulary table HTML
-    vocab_rows = ""
-    for i, item in enumerate(content['vocabulary'], 1):
-        vocab_rows += f"""
-        <tr>
-            <td>{i}</td>
-            <td class="chinese">{item['chinese']}</td>
-            <td class="pinyin">{item['pinyin']}</td>
-            <td>{item['english']}</td>
-        </tr>
-        """
-    
-    # Build discussion questions HTML
-    questions_html = ""
-    for i, question in enumerate(content['discussion_questions'], 1):
-        questions_html += f"""
-        <div class="question">
-            <span class="question-number">{i}</span>
-            <span class="question-text">{question}</span>
-        </div>
-        """
-    
-    html_content = f"""<!DOCTYPE html>
-<html lang="zh-CN">
+    return f"""<!DOCTYPE html>
+<html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Chinese Learning Materials: {topic}</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
-            line-height: 1.8;
-            color: #333;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-            min-height: 100vh;
-        }}
-        
-        .container {{
-            max-width: 900px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            overflow: hidden;
-        }}
-        
-        .header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 40px;
-            text-align: center;
-        }}
-        
-        .header h1 {{
-            font-size: 2em;
-            margin-bottom: 10px;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
-        }}
-        
-        .header .subtitle {{
-            font-size: 0.9em;
-            opacity: 0.9;
-        }}
-        
-        .content {{
-            padding: 40px;
-        }}
-        
-        .section {{
-            margin-bottom: 50px;
-        }}
-        
-        .section-title {{
-            font-size: 1.8em;
-            color: #667eea;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 3px solid #667eea;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }}
-        
-        .section-icon {{
-            font-size: 1.2em;
-        }}
-        
-        .main-text {{
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            padding: 30px;
-            border-radius: 15px;
-            font-size: 1.3em;
-            line-height: 2;
-            color: #2c3e50;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-        }}
-        
-        .chinese {{
-            font-size: 1.2em;
-            font-weight: 600;
-            color: #2c3e50;
-        }}
-        
-        .pinyin {{
-            color: #7f8c8d;
-            font-style: italic;
-        }}
-        
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            border-radius: 10px;
-            overflow: hidden;
-        }}
-        
-        thead {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-        }}
-        
-        th {{
-            padding: 15px;
-            text-align: left;
-            font-weight: 600;
-        }}
-        
-        tbody tr:nth-child(even) {{
-            background: #f8f9fa;
-        }}
-        
-        tbody tr:hover {{
-            background: #e9ecef;
-            transition: background 0.3s;
-        }}
-        
-        td {{
-            padding: 15px;
-            border-bottom: 1px solid #dee2e6;
-        }}
-        
-        .opinion-card {{
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            margin-bottom: 20px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            border-left: 5px solid;
-        }}
-        
-        .opinion-positive {{
-            border-left-color: #2ecc71;
-        }}
-        
-        .opinion-negative {{
-            border-left-color: #e74c3c;
-        }}
-        
-        .opinion-balanced {{
-            border-left-color: #f39c12;
-        }}
-        
-        .opinion-header {{
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 15px;
-            font-size: 1.3em;
-            font-weight: 600;
-        }}
-        
-        .opinion-text {{
-            font-size: 1.1em;
-            line-height: 2;
-            color: #2c3e50;
-        }}
-        
-        .question {{
-            background: #f8f9fa;
-            padding: 20px;
-            margin-bottom: 15px;
-            border-radius: 10px;
-            display: flex;
-            gap: 15px;
-            align-items: start;
-            box-shadow: 0 3px 10px rgba(0,0,0,0.05);
-        }}
-        
-        .question-number {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            width: 35px;
-            height: 35px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: bold;
-            flex-shrink: 0;
-        }}
-        
-        .question-text {{
-            font-size: 1.1em;
-            line-height: 1.8;
-            color: #2c3e50;
-        }}
-        
-        .footer {{
-            background: #f8f9fa;
-            padding: 30px;
-            text-align: center;
-            color: #6c757d;
-            border-top: 1px solid #dee2e6;
-        }}
-        
-        @media print {{
-            body {{
-                background: white;
-                padding: 0;
-            }}
-            .container {{
-                box-shadow: none;
-            }}
-        }}
-        
-        @media (max-width: 768px) {{
-            .content {{
-                padding: 20px;
-            }}
-            .header {{
-                padding: 30px 20px;
-            }}
-            .main-text {{
-                font-size: 1.1em;
-            }}
-        }}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:Georgia,serif;background:#f9f6f0;color:#2c2c2c;max-width:780px;margin:40px auto;padding:0 24px 60px;line-height:1.75}}
+header{{text-align:center;padding:36px 0 28px;border-bottom:2px solid #d4a96a;margin-bottom:32px}}
+header h1{{font-size:1.75em;color:#2c2c2c;margin-bottom:10px}}
+.meta{{font-size:.9em;color:#888;font-style:italic}}
+.badge{{display:inline-block;background:#d4a96a;color:#fff;border-radius:20px;padding:3px 14px;font-size:.82em;margin:0 4px;font-style:normal;font-family:sans-serif}}
+.turn{{display:flex;gap:14px;margin-bottom:16px;padding:14px 18px;border-radius:10px}}
+.turn.elena{{background:#fff8ee;border-left:4px solid #e8924a}}
+.turn.marcos{{background:#f0f5ff;border-left:4px solid #5577cc}}
+.name{{font-weight:700;font-family:sans-serif;font-size:.82em;min-width:62px;padding-top:4px;text-transform:uppercase;letter-spacing:.06em}}
+.turn.elena .name{{color:#c46a20}}
+.turn.marcos .name{{color:#3355aa}}
+.turn p{{flex:1}}
+h2{{font-size:1em;color:#666;margin:40px 0 14px;padding-bottom:6px;border-bottom:1px solid #ddd;font-family:sans-serif;text-transform:uppercase;letter-spacing:.1em}}
+table{{width:100%;border-collapse:collapse;font-size:.95em}}
+td{{padding:9px 14px;border-bottom:1px solid #eee}}
+td.sp{{font-weight:700;color:#c46a20;width:50%}}
+td.en{{color:#3355aa}}
+tr:hover td{{background:#fdf3e7}}
+footer{{text-align:center;margin-top:50px;font-size:.78em;color:#bbb;font-family:sans-serif}}
+</style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🎓 Chinese Learning Materials</h1>
-            <div class="subtitle">Topic: {topic}</div>
-            <div class="subtitle">Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
-        </div>
-        
-        <div class="content">
-           
-            
-            <!-- Vocabulary -->
-            <div class="section">
-                <h2 class="section-title">
-                    <span class="section-icon">📚</span>
-                    Vocabulary List
-                </h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>#</th>
-                            <th>Chinese</th>
-                            <th>Pinyin</th>
-                            <th>English</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {vocab_rows}
-                    </tbody>
-                </table>
-            </div>
-             <!-- Main Text -->
-            <div class="section">
-                <h2 class="section-title">
-                    <span class="section-icon">📖</span>
-                    Main Text
-                </h2>
-                <div class="main-text">{content['main_text']}</div>
-            </div>
-            
-            <!-- Opinion Texts -->
-            <div class="section">
-                <h2 class="section-title">
-                    <span class="section-icon">💭</span>
-                    Different Perspectives
-                </h2>
-                
-                <div class="opinion-card opinion-positive">
-                    <div class="opinion-header">
-                        <span>😊</span>
-                        <span>Positive View</span>
-                    </div>
-                    <div class="opinion-text">{content['opinion_texts']['positive']}</div>
-                </div>
-                
-                <div class="opinion-card opinion-negative">
-                    <div class="opinion-header">
-                        <span>🤔</span>
-                        <span>Critical View</span>
-                    </div>
-                    <div class="opinion-text">{content['opinion_texts']['negative']}</div>
-                </div>
-                
-                <div class="opinion-card opinion-balanced">
-                    <div class="opinion-header">
-                        <span>⚖️</span>
-                        <span>Balanced View</span>
-                    </div>
-                    <div class="opinion-text">{content['opinion_texts']['balanced']}</div>
-                </div>
-            </div>
-            
-            <!-- Discussion Questions -->
-            <div class="section">
-                <h2 class="section-title">
-                    <span class="section-icon">💬</span>
-                    Discussion Questions
-                </h2>
-                {questions_html}
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>Generated by Chinese Learning Bot 🤖</p>
-            <p>HSK5 Level Materials</p>
-        </div>
-    </div>
+<header>
+  <h1>{title}</h1>
+  <div class="meta">
+    <span class="badge">{country_es}</span><span class="badge">{subtopic_es}</span>
+    &nbsp;·&nbsp; Elena &amp; Marcos &nbsp;·&nbsp; {date_str}
+  </div>
+</header>
+<h2>🎙 Diálogo</h2>
+{turns_html}
+<h2>📌 Colocaciones clave</h2>
+<table>
+<thead><tr>
+  <th style="text-align:left;padding:9px 14px;color:#999;font-family:sans-serif;font-size:.82em">ESPAÑOL</th>
+  <th style="text-align:left;padding:9px 14px;color:#999;font-family:sans-serif;font-size:.82em">ENGLISH</th>
+</tr></thead>
+<tbody>{col_rows}</tbody>
+</table>
+<footer>vocab-news-bot · {date_str}</footer>
 </body>
-</html>"""
-    
-    return html_filename, html_content
+</html>""".encode("utf-8")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /start is issued."""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GOOGLE SHEETS — per-user tab (auto-created by Telegram username)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_or_create_sheet(username: str):
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds  = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
+    client = gspread.authorize(creds)
+    ss     = client.open_by_url(SPREADSHEET_URL)
+    try:
+        return ss.worksheet(username)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title=username, rows=1000, cols=3)
+        ws.append_row(["Español", "English", "Fecha"], value_input_option="USER_ENTERED")
+        log.info(f"[Sheets] Created tab: {username}")
+        return ws
+
+
+def save_collocation(username: str, spanish: str, english: str) -> bool:
+    try:
+        ws = get_or_create_sheet(username)
+        ws.append_row([spanish, english, datetime.now().strftime("%Y-%m-%d")],
+                      value_input_option="USER_ENTERED")
+        log.info(f"[Sheets] {username}: {spanish}")
+        return True
+    except Exception as e:
+        log.error(f"[Sheets] {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TTS — synthesize, fade (no clicks), stitch, MP3
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_tts_client():
+    return texttospeech.TextToSpeechClient(
+        credentials=Credentials.from_service_account_file(
+            GOOGLE_CREDS_FILE,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+    )
+
+
+def synthesize_turn(text: str, voice_name: str, client) -> bytes:
+    return client.synthesize_speech(
+        input=texttospeech.SynthesisInput(text=text),
+        voice=texttospeech.VoiceSelectionParams(language_code="es-US", name=voice_name),
+        audio_config=texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=24000,
+        ),
+    ).audio_content
+
+
+def pcm_to_wav(pcm: bytes, rate: int = 24000) -> bytes:
+    buf = BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def fade_pcm(pcm: bytes, fade_ms: int = 15, rate: int = 24000) -> bytes:
+    """Linear fade-in + fade-out on 16-bit mono PCM — eliminates boundary clicks."""
+    fade_n = int(rate * fade_ms / 1000)
+    n      = len(pcm) // 2
+    if n < fade_n * 2:
+        return pcm
+    samples = list(struct.unpack(f"<{n}h", pcm))
+    for i in range(fade_n):
+        samples[i]               = int(samples[i] * i / fade_n)
+        samples[n - fade_n + i]  = int(samples[n - fade_n + i] * (fade_n - i) / fade_n)
+    return struct.pack(f"<{n}h", *samples)
+
+
+def concatenate_wavs(wavs: list, pause_ms: int = 600, rate: int = 24000) -> bytes:
+    silence = b"\x00\x00" * int(rate * pause_ms / 1000)
+    frames  = b""
+    for w in wavs:
+        with wave.open(BytesIO(w), "rb") as wf:
+            frames += fade_pcm(wf.readframes(wf.getnframes()))
+        frames += silence
+    out = BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+        wf.writeframes(frames)
+    return out.getvalue()
+
+
+def wav_to_mp3(wav: bytes) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(wav); in_p = f.name
+    out_p = in_p.replace(".wav", ".mp3")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", in_p, "-codec:a", "libmp3lame", "-qscale:a", "2", out_p],
+            check=True, capture_output=True,
+        )
+        return open(out_p, "rb").read()
+    finally:
+        for p in (in_p, out_p):
+            try: os.unlink(p)
+            except: pass
+
+
+def build_audio(turns: list) -> bytes:
+    client = get_tts_client()
+    chunks = []
+    for i, t in enumerate(turns):
+        voice = FEMALE_VOICE if t["speaker"] == "Elena" else MALE_VOICE
+        log.info(f"[TTS] {i+1}/{len(turns)} {t['speaker']}")
+        try:
+            chunks.append(pcm_to_wav(synthesize_turn(t["text"], voice, client)))
+        except Exception as e:
+            log.error(f"[TTS] turn {i+1}: {e}")
+        time.sleep(0.3)
+    return wav_to_mp3(concatenate_wavs(chunks))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_username(user) -> str:
+    """Telegram username, or first name, or user_id as fallback."""
+    return user.username or user.first_name or str(user.id)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_user.first_name or "ahí"
     await update.message.reply_text(
-        "欢迎! Enter your topic,detailed without being too long! 🎓\n\n"
-        
+        f"👋 ¡Hola, {name}! Soy tu bot de podcasts en español 🎙\n"
+        "Envía /news para empezar."
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /help is issued."""
-    user_id = update.effective_user.id
-    reset_time = rate_limiter.get_reset_time(user_id)
-    
-    help_text = (
-        "📖 **How to Use:**\n\n"
-        "1. Send me any topic (max 100 characters)\n"
-        "2. Wait 30-60 seconds for generation\n"
-        "3. Receive comprehensive materials:\n"
-        "   • Beautiful HTML document\n"
-        "   • Vocabulary file with TTS tags\n"
-        "   • 3 audio files (different perspectives)\n"
-        "   • Discussion questions\n"
-        "   • Complete ZIP package\n\n"
-        "📦 **For Anki Import:**\n"
-        "1. Download the ZIP file\n"
-        "2. Extract MP3 files to your Anki collection.media folder\n"
-        "3. Import the .txt file into Anki\n"
-        "4. See Anki docs for your platform's media folder location\n\n"
-        "⚡ **Rate Limit:** 5 requests per hour\n"
+
+async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1 — pick country."""
+    keyboard = [
+        [InlineKeyboardButton(COUNTRY_LABELS["argentina"], callback_data="country:argentina"),
+         InlineKeyboardButton(COUNTRY_LABELS["rusia"],     callback_data="country:rusia")],
+        [InlineKeyboardButton(COUNTRY_LABELS["turquia"],   callback_data="country:turquia"),
+         InlineKeyboardButton(COUNTRY_LABELS["china"],     callback_data="country:china")],
+        [InlineKeyboardButton(COUNTRY_LABELS["usa"],       callback_data="country:usa")],
+    ]
+    await update.message.reply_text(
+        "🌍 *Paso 1 — ¿De qué país?*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    
-    if reset_time > 0:
-        help_text += f"⏱️ Your limit resets in {reset_time // 60} minutes\n\n"
-    
-    help_text += (
-        "💡 **Example Topics:**\n"
-        "• 社交媒体的影响\n"
-        "• work-life balance\n"
-        "• 环境保护\n"
-        "• modern technology\n"
-        "• 城市生活的压力"
+
+
+async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2 — country chosen, show subtopics."""
+    query = update.callback_query
+    await query.answer()
+    country       = query.data.split(":", 1)[1]
+    country_label = COUNTRY_LABELS.get(country, country)
+
+    keyboard = [
+        [InlineKeyboardButton(SUBTOPIC_LABELS["medicina"],   callback_data=f"topic:{country}:medicina"),
+         InlineKeyboardButton(SUBTOPIC_LABELS["psicologia"], callback_data=f"topic:{country}:psicologia")],
+        [InlineKeyboardButton(SUBTOPIC_LABELS["tango"],      callback_data=f"topic:{country}:tango"),
+         InlineKeyboardButton(SUBTOPIC_LABELS["cultura"],    callback_data=f"topic:{country}:cultura")],
+        [InlineKeyboardButton(SUBTOPIC_LABELS["economia"],   callback_data=f"topic:{country}:economia"),
+         InlineKeyboardButton(SUBTOPIC_LABELS["ia"],         callback_data=f"topic:{country}:ia")],
+    ]
+    await query.edit_message_text(
+        f"✅ País: *{country_label}*\n\n🎯 *Paso 2 — ¿Qué tema?*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+
 
 async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle topic message and generate all materials"""
-    user_id = update.effective_user.id
-    topic_raw = update.message.text.strip()
-    
-    # Check rate limit
-    if not rate_limiter.is_allowed(user_id):
-        reset_time = rate_limiter.get_reset_time(user_id)
-        await update.message.reply_text(
-            f"⏱️ Rate limit reached!\n\n"
-            f"You've used your 5 requests for this hour.\n"
-            f"Please try again in {reset_time // 60} minutes.\n\n"
-            f"This helps manage API costs. Thank you for understanding! 🙏"
+    """Full pipeline: headlines → script → questions → audio → collocations → HTML."""
+    query = update.callback_query
+    await query.answer()
+
+    _, country, subtopic = query.data.split(":", 2)
+    chat_id        = query.message.chat_id
+    username       = get_username(query.from_user)
+    country_label  = COUNTRY_LABELS.get(country, country)
+    subtopic_label = SUBTOPIC_LABELS.get(subtopic, subtopic)
+
+    status = await query.message.reply_text("⏳ Buscando noticias...")
+
+    try:
+        # 1. Headlines
+        await status.edit_text(f"📰 Obteniendo titulares — {country_label} · {subtopic_label}...")
+        headlines = await asyncio.get_event_loop().run_in_executor(
+            None, fetch_headlines, country, subtopic, 6
         )
-        return
-    
-    # Validate and sanitize topic
-    try:
-        topic = validate_topic(topic_raw)
-    except ValueError as e:
-        await update.message.reply_text(f"❌ Invalid topic: {str(e)}\n\nPlease try a different topic.")
-        return
-    
-    # Send initial message with typing action
-    await update.message.chat.send_action(action="typing")
-    
-    progress_msg = await update.message.reply_text(
-        f"📚 Creating materials about '{topic}'...\n\n"
-        f"⏳ Progress: 0/5\n"
-        f"⬜⬜⬜⬜⬜\n"
-        f"Initializing..."
-    )
-    
-    # Progress tracking
-    async def update_progress(step, message):
-        progress_bar = "🟩" * step + "⬜" * (5 - step)
-        try:
-            await progress_msg.edit_text(
-                f"📚 Creating materials about '{topic}'...\n\n"
-                f"⏳ Progress: {step}/5\n"
-                f"{progress_bar}\n"
-                f"{message}"
-            )
-        except:
-            pass  # Ignore edit errors
-    
-    try:
-        # Step 1: Generate content with DeepSeek
-        await update_progress(1, "🤖 Generating content with AI...")
-        await update.message.chat.send_action(action="typing")
-        
-        print(f"[Bot] Starting content generation for user {user_id}, topic: {topic[:50]}")
-        
-        try:
-            content = generate_content_with_deepseek(topic)
-        except Exception as e:
-            print(f"[Bot] Content generation failed: {type(e).__name__}: {str(e)}")
-            raise
-        
-        if not content:
-            await update.message.reply_text(
-                "❌ Failed to generate content. Please try again with a different topic.\n\n"
-                "If the problem persists, the topic might be too complex or controversial."
-            )
+        if not headlines:
+            await status.edit_text("❌ No encontré noticias. Inténtalo más tarde.")
             return
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_topic = safe_filename(topic)
-        
-        # Step 2: Create and send HTML document
-        await update_progress(2, "📄 Creating HTML document...")
-        
-        html_filename, html_content = create_html_document(topic, content, timestamp)
-        html_file = BytesIO(html_content.encode('utf-8'))
-        html_file.name = html_filename
-        
-        await update.message.reply_document(
-            document=html_file,
-            filename=html_filename,
-            caption="HTML"
+
+        # 2. Script (includes questions + collocations)
+        await status.edit_text("✍️ Generando guion (DeepSeek)...")
+        script = await asyncio.get_event_loop().run_in_executor(
+            None, generate_script, country, subtopic, headlines
         )
-        
-       
-        
-        # Step 3: Create vocabulary file with TTS
-        await update_progress(3, "🎵 Generating TTS audio for vocabulary...")
-        await update.message.chat.send_action(action="record_voice")
-        
-        async def vocab_progress(current, total):
-            if current % 3 == 0:  # Update every 3 items
-                await update_progress(3, f"🎵 Generating TTS audio... ({current}/{total})")
-        
-        vocab_filename, vocab_content, audio_files = await create_vocabulary_file_with_tts(
-            content['vocabulary'], 
-            safe_topic,
-            progress_callback=vocab_progress
-        )
-        
-        if not audio_files:
-            await update.message.reply_text("⚠️ Warning: Could not generate TTS audio for vocabulary.")
-        
-        # Step 4: Create ZIP package (now includes HTML file)
-        await update_progress(4, "📦 Creating complete package...")
-        
-        try:
-            # Get HTML content for ZIP
-            html_filename, html_content = create_html_document(topic, content, timestamp)
-            
-            # Create enhanced ZIP with HTML
-            zip_filename = f"{safe_topic}_{timestamp}_complete_package.zip"
-            zip_buffer = BytesIO()
-            
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                # Add vocabulary text file
-                safe_vocab_filename = safe_filename(vocab_filename)
-                zip_file.writestr(safe_vocab_filename, vocab_content.encode('utf-8'))
-                
-                # Add HTML document
-                safe_html_filename = safe_filename(html_filename)
-                zip_file.writestr(safe_html_filename, html_content.encode('utf-8'))
-                
-                # Add all audio files
-                for audio_filename, audio_data in audio_files.items():
-                    safe_audio_filename = safe_filename(audio_filename)
-                    zip_file.writestr(safe_audio_filename, audio_data)
-            
-            zip_buffer.seek(0)
-            
-            # Check file size
-            file_size = zip_buffer.getbuffer().nbytes
-            if file_size > config.MAX_FILE_SIZE:
-                raise ValueError(f"ZIP file too large: {file_size / 1024 / 1024:.1f}MB")
-            
-            # Send ZIP file
-            zip_buffer.name = zip_filename
-            await update.message.reply_document(
-                document=zip_buffer, 
-                filename=zip_filename,
-                caption=f"📦 ZIP "
-                       
+
+        turns        = script.get("turns", [])
+        title        = script.get("title", f"{country_label} · {subtopic_label}")
+        collocations = script.get("collocations", [])
+        questions    = script.get("questions", [])
+
+        if not turns:
+            await status.edit_text("❌ Error generando el guion. Inténtalo de nuevo.")
+            return
+
+        # 3. Send questions BEFORE audio
+        if questions:
+            q_lines = "\n\n".join(f"*{i}.* {q}" for i, q in enumerate(questions[:3], 1))
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🤔 *Antes de escuchar — tres preguntas para pensar:*\n\n"
+                    + q_lines
+                    + "\n\n_Escucha el podcast e intenta responderlas_ 🎧"
+                ),
+                parse_mode="Markdown",
             )
-        except ValueError as e:
-            await update.message.reply_text(f"⚠️ {str(e)}")
-            # Send files separately if ZIP is too large
-            html_file = BytesIO(html_content.encode('utf-8'))
-            html_file.name = html_filename
-            await update.message.reply_document(document=html_file, filename=html_filename)
-            
-            vocab_file = BytesIO(vocab_content.encode('utf-8'))
-            vocab_file.name = vocab_filename
-            await update.message.reply_document(document=vocab_file, filename=vocab_filename)
-        
-        # Step 5: Generate and send opinion texts with audio
-        await update_progress(5, "🎤 Generating opinion texts with audio...")
-        
-        perspectives = [
-            ("positive", "Positive View", "😊"),
-            ("negative", "Critical View", "🤔"),
-            ("balanced", "Balanced View", "⚖️")
-        ]
-        
-        # Generate all opinion audio concurrently
-        opinion_tasks = []
-        for key, name, emoji in perspectives:
-            opinion_tasks.append(generate_tts_async(content['opinion_texts'][key], use_chirp=True))
-        
-        opinion_audios = await asyncio.gather(*opinion_tasks, return_exceptions=True)
-        
-        for (key, name, emoji), audio_data in zip(perspectives, opinion_audios):
-            opinion_text = content['opinion_texts'][key]
-            
-            # Send text
-            await update.message.reply_text(f"{emoji} **{name}:**\n\n{opinion_text}", parse_mode='Markdown')
-            
-            # Send audio if generation succeeded
-            if not isinstance(audio_data, Exception) and audio_data:
-                audio_filename = f"{safe_topic}_{timestamp}_{key}.mp3"
-                audio_file = BytesIO(audio_data)
-                audio_file.name = audio_filename
-                await update.message.reply_audio(audio=audio_file, filename=audio_filename)
-            else:
-                await update.message.reply_text(f"⚠️ Could not generate audio for {name}.")
-        
-        # Send discussion questions (keeping in chat for quick reference)
-        questions_text = "💬 **Discussion Questions:**\n\n"
-        for i, question in enumerate(content['discussion_questions'], 1):
-            questions_text += f"{i}. {question}\n"
-        
-        await update.message.reply_text(questions_text, parse_mode='Markdown')
-        
-        # Final success message
-        await progress_msg.edit_text(
-            f"✅ **Complete!**\n\n"
-            
+
+        # 4. TTS
+        await status.edit_text("🔊 Sintetizando audio (~1-2 min)...")
+        mp3 = await asyncio.get_event_loop().run_in_executor(None, build_audio, turns)
+
+        # 5. Send MP3
+        await status.delete()
+        await context.bot.send_audio(
+            chat_id=chat_id,
+            audio=mp3,
+            filename=f"podcast_{country}_{subtopic}_{datetime.now().strftime('%Y%m%d')}.mp3",
+            caption=f"🎙 *{title}*\nElena & Marcos — {country_label} · {subtopic_label}",
+            parse_mode="Markdown",
         )
-        
-        await update.message.reply_text(
-           
-            "Need help? Send /help"
+
+        # 6. Collocation buttons (10, stacked Spanish / English)
+        if collocations:
+            PENDING_COLLOCATIONS[chat_id] = {
+                "cols":     collocations,
+                "username": username,
+                "saved":    set(),
+            }
+            keyboard = []
+            for idx, col in enumerate(collocations[:10]):
+                sp = col.get("spanish", "")
+                en = col.get("english", "")
+                keyboard.append([InlineKeyboardButton(sp, callback_data=f"col:{idx}")])
+                keyboard.append([InlineKeyboardButton(en, callback_data=f"col:{idx}")])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="💾 *Colocaciones del episodio* — toca para guardar en tu hoja:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
+        # 7. HTML transcript
+        html_bytes = build_html_transcript(title, country, subtopic, turns, collocations)
+        safe_title = re.sub(r"[^\w\s-]", "", title)[:40].strip().replace(" ", "_")
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=html_bytes,
+            filename=f"{safe_title}.html",
+            caption="📄 Transcripción del episodio",
         )
-        
+
     except Exception as e:
-        error_msg = str(e)
-        await update.message.reply_text(
-            f"❌ **Error occurred:**\n{error_msg}\n\n"
-            f"Please try again with a different topic or contact support if the issue persists.\n\n"
-            f"Suggestions:\n"
-            f"• Try a simpler or more specific topic\n"
-            f"• Avoid very long or complex phrases\n"
-            f"• Check that your topic is appropriate"
+        log.error(f"Pipeline error: {e}", exc_info=True)
+        try:
+            await status.edit_text(f"❌ Error: {e}")
+        except Exception:
+            pass
+
+
+async def handle_collocation_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+
+    if not query.data.startswith("col:"):
+        return
+
+    try:
+        idx   = int(query.data.split(":", 1)[1])
+        state = PENDING_COLLOCATIONS.get(chat_id)
+        if not state or idx >= len(state["cols"]):
+            await query.answer("⚠️ Datos caducados. Genera un nuevo podcast.", show_alert=True)
+            return
+
+        col      = state["cols"][idx]
+        spanish  = col.get("spanish", "")
+        english  = col.get("english", "")
+        username = state["username"]
+
+        ok = await asyncio.get_event_loop().run_in_executor(
+            None, save_collocation, username, spanish, english
         )
-        print(f"Error for user {user_id}, topic '{topic}': {error_msg}")
+
+        if ok:
+            state["saved"].add(idx)
+            await query.answer(f"✅ Guardado: {spanish}", show_alert=False)
+        else:
+            await query.answer("❌ Error al guardar.", show_alert=True)
+            return
+
+        # Rebuild keyboard with checkmarks
+        cols = state["cols"]
+        keyboard = []
+        for i, c in enumerate(cols[:10]):
+            sp   = c.get("spanish", "")
+            en   = c.get("english", "")
+            mark = " ✅" if i in state["saved"] else ""
+            keyboard.append([InlineKeyboardButton(sp + mark, callback_data=f"col:{i}")])
+            keyboard.append([InlineKeyboardButton(en + mark, callback_data=f"col:{i}")])
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+    except Exception as e:
+        log.error(f"Col button: {e}")
+        await query.answer("❌ Error.", show_alert=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """Start the bot"""
-    if not TELEGRAM_BOT_TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN not found in environment variables")
-        return
-    
-    if not DEEPSEEK_API_KEY:
-        print("Error: DEEPSEEK_API_KEY not found in environment variables")
-        return
-    
-    print("Bot configuration:")
-    print(f"- Rate limit: {config.RATE_LIMIT_REQUESTS} requests per {config.RATE_LIMIT_WINDOW // 3600} hour(s)")
-    print(f"- Max topic length: {config.MAX_TOPIC_LENGTH} characters")
-    print(f"- API retry attempts: {config.API_RETRY_ATTEMPTS}")
-    print(f"- Content level: HSK5 (250 character main text)")
-    print(f"- Vocabulary focus: Collocations and phrases")
-    
-    # Create the Application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_topic))
-    
-    # Run the bot
-    print("Bot is running...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("news",  cmd_news))
+    app.add_handler(CallbackQueryHandler(handle_country,            pattern=r"^country:"))
+    app.add_handler(CallbackQueryHandler(handle_topic,              pattern=r"^topic:"))
+    app.add_handler(CallbackQueryHandler(handle_collocation_button, pattern=r"^col:"))
+    log.info("✅ vocab-news-bot v2 running.")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
